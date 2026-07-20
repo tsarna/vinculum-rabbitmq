@@ -64,6 +64,7 @@ type RMQReceiver struct {
 	exclusive     bool
 	autoAck       bool
 	wireFormat    wire.WireFormat
+	onDecodeError wire.DecodeErrorHook
 	consumerTag   string
 	declare       *Declare
 	bindings      []Binding
@@ -229,16 +230,38 @@ func (r *RMQReceiver) handleDelivery(ctx context.Context, d amqp.Delivery) {
 		mergedFields[k] = v
 	}
 
-	// Deserialize body. Fall back to raw bytes on error (same as MQTT subscriber).
+	// Deserialize body. A decode failure is fatal to the message: the
+	// configured wire format is a contract, so a body that doesn't satisfy
+	// it is nacked rather than delivered as raw bytes. Use wire format
+	// "auto" for best-effort decoding.
 	var msg any
 	if d.Body != nil {
 		var deserErr error
 		msg, deserErr = r.wireFormat.Deserialize(d.Body)
 		if deserErr != nil {
-			r.logger.Warn("rabbitmq receiver: deserialize failed, passing raw bytes",
+			r.logger.Error("rabbitmq receiver: deserialize failed",
 				zap.String("routing_key", d.RoutingKey),
+				zap.String("wire_format", r.wireFormat.Name()),
 				zap.Error(deserErr))
-			msg = d.Body
+			r.metrics.RecordReceived(ctx, r.queue, "deserialize")
+			if r.onDecodeError != nil {
+				r.onDecodeError(ctx, wire.DecodeError{
+					Raw:    d.Body,
+					Err:    deserErr,
+					Format: r.wireFormat.Name(),
+					// vinculumTopic here is the pre-VinculumTopicFunc
+					// value; the func needs msg, which we don't have.
+					Topic:  vinculumTopic,
+					Fields: mergedFields,
+					Attrs: map[string]string{
+						"routing_key": d.RoutingKey,
+						"exchange":    d.Exchange,
+						"queue":       r.queue,
+					},
+				})
+			}
+			r.nack(d)
+			return
 		}
 	}
 

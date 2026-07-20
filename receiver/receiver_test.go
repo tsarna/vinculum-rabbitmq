@@ -321,7 +321,7 @@ func TestHandleDelivery_ExtractedFieldsMergedAndPrecede(t *testing.T) {
 	assert.Equal(t, "abc", sub.lastFlds["deviceId"], "pattern-extracted value takes precedence")
 }
 
-func TestHandleDelivery_DeserializeFallback(t *testing.T) {
+func TestHandleDelivery_DeserializeErrorNacksAndDoesNotDeliver(t *testing.T) {
 	sub := &fakeSubscriber{}
 	r, err := NewReceiver().
 		WithQueue("q").
@@ -330,13 +330,71 @@ func TestHandleDelivery_DeserializeFallback(t *testing.T) {
 		Build()
 	require.NoError(t, err)
 
-	// Invalid JSON triggers the wire format error; receiver should pass raw bytes.
+	// The configured wire format is a contract: a body that doesn't satisfy
+	// it is nacked, not delivered as raw bytes.
 	body := []byte("not json {{")
 	d, ack := newDelivery("ex", "foo", body, nil)
 	r.handleDelivery(context.Background(), d)
 
-	assert.Equal(t, body, sub.lastMsg)
+	assert.Equal(t, 0, sub.calls, "malformed message must not be delivered")
+	assert.Equal(t, 0, ack.acks)
+	assert.Equal(t, 1, ack.nacks)
+}
+
+func TestHandleDelivery_DeserializeErrorInvokesHook(t *testing.T) {
+	sub := &fakeSubscriber{}
+	var got wire.DecodeError
+	var hookCalls int
+
+	r, err := NewReceiver().
+		WithQueue("q").
+		WithSubscriber(sub).
+		WithWireFormat(wire.JSON).
+		WithSubscription(Subscription{RoutingKeyPattern: "sensor.*deviceId.reading"}).
+		WithDecodeErrorHook(func(_ context.Context, e wire.DecodeError) {
+			hookCalls++
+			got = e
+		}).
+		Build()
+	require.NoError(t, err)
+
+	body := []byte("not json {{")
+	d, ack := newDelivery("ex", "sensor.abc.reading", body, amqp.Table{"source": "test"})
+	r.handleDelivery(context.Background(), d)
+
+	require.Equal(t, 1, hookCalls)
+	assert.Equal(t, body, got.Raw)
+	assert.Equal(t, "json", got.Format)
+	require.Error(t, got.Err)
+	assert.Equal(t, "sensor.abc.reading", got.Attrs["routing_key"])
+	assert.Equal(t, "ex", got.Attrs["exchange"])
+	assert.Equal(t, "q", got.Attrs["queue"])
+	assert.Equal(t, "abc", got.Fields["deviceId"], "fields extracted before the failure are carried")
+	assert.Equal(t, "test", got.Fields["source"])
+
+	// The hook observes; it does not suppress.
+	assert.Equal(t, 0, sub.calls)
+	assert.Equal(t, 1, ack.nacks)
+}
+
+func TestHandleDelivery_AutoWireFormatToleratesNonJSON(t *testing.T) {
+	sub := &fakeSubscriber{}
+	r, err := NewReceiver().
+		WithQueue("q").
+		WithSubscriber(sub).
+		WithWireFormat(wire.Auto).
+		Build()
+	require.NoError(t, err)
+
+	// "auto" is the documented migration path off the old tolerant behavior:
+	// it never fails to decode, yielding a string.
+	d, ack := newDelivery("ex", "foo", []byte("not json {{"), nil)
+	r.handleDelivery(context.Background(), d)
+
+	assert.Equal(t, 1, sub.calls)
+	assert.Equal(t, "not json {{", sub.lastMsg)
 	assert.Equal(t, 1, ack.acks)
+	assert.Equal(t, 0, ack.nacks)
 }
 
 func TestHandleDelivery_AutoAckSkipsAckCall(t *testing.T) {

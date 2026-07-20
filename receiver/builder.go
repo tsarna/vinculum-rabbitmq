@@ -22,6 +22,7 @@ type ReceiverBuilder struct {
 	exclusive      bool
 	autoAck        bool
 	wireFormat     wire.WireFormat
+	onDecodeError  wire.DecodeErrorHook
 	consumerTag    string
 	declare        *Declare
 	bindings       []Binding
@@ -110,6 +111,14 @@ func (b *ReceiverBuilder) WithWireFormatName(name string) *ReceiverBuilder {
 	return b
 }
 
+// WithDecodeErrorHook sets an observer invoked when an inbound body fails
+// to deserialize. The hook cannot suppress the failure: the message is
+// nacked either way. nil (the default) means no observer.
+func (b *ReceiverBuilder) WithDecodeErrorHook(h wire.DecodeErrorHook) *ReceiverBuilder {
+	b.onDecodeError = h
+	return b
+}
+
 // WithConsumerTag sets the AMQP consumer tag. Empty (default) means the
 // broker assigns one.
 func (b *ReceiverBuilder) WithConsumerTag(tag string) *ReceiverBuilder {
@@ -188,6 +197,7 @@ func (b *ReceiverBuilder) Build() (*RMQReceiver, error) {
 		exclusive:      b.exclusive,
 		autoAck:        b.autoAck,
 		wireFormat:     b.wireFormat,
+		onDecodeError:  b.onDecodeError,
 		consumerTag:    b.consumerTag,
 		declare:        b.declare,
 		bindings:       b.bindings,
