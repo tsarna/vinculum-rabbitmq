@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Requires `github.com/tsarna/vinculum-wire` v0.5.0, for `wire.IsReservedAttr`. The
+  receiver's decode-error test now checks every `Attrs` key against it. A key that
+  collides with one of `DecodeError`'s own fields is dropped by a consumer rather than
+  allowed to shadow the fixed field, so its value is silently lost between the receiver
+  that set it and whatever reads it — which is what happened to `vinculum-mqtt`'s
+  `Attrs["topic"]`, a duplicate of `Topic` that never reached a config. This module's
+  keys (`routing_key`, `exchange`, `queue`) are and always were clean; the check is what
+  keeps a future rename from quietly breaking one.
+
 ## [0.2.0] - 2026-07-19
 
 ### Changed

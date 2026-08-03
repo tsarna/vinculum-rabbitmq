@@ -372,6 +372,15 @@ func TestHandleDelivery_DeserializeErrorInvokesHook(t *testing.T) {
 	assert.Equal(t, "abc", got.Fields["deviceId"], "fields extracted before the failure are carried")
 	assert.Equal(t, "test", got.Fields["source"])
 
+	// A key colliding with one of DecodeError's own fields is dropped by a
+	// consumer rather than allowed to shadow it, so it would vanish between
+	// here and whatever reads it — as vinculum-mqtt's Attrs["topic"] did.
+	// Fail at the source, the only place the name can still be changed.
+	for key := range got.Attrs {
+		assert.False(t, wire.IsReservedAttr(key),
+			"Attrs key %q collides with a fixed DecodeError field and would be dropped", key)
+	}
+
 	// The hook observes; it does not suppress.
 	assert.Equal(t, 0, sub.calls)
 	assert.Equal(t, 1, ack.nacks)
