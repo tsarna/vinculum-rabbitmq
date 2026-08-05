@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-05
+
+### Added
+
+- **`Config.MaxReconnectAttempts`** bounds how many attempts to re-establish a lost
+  connection are made before the client gives up. Zero or negative reconnects forever,
+  which is both the default and the behaviour before this field existed, so upgrading
+  changes nothing until you set it. One attempt is one full walk of the `Brokers` list —
+  the same unit `ReconnectBackoff` already counts in.
+
+  Zero meaning *unlimited* rather than *never reconnect* is deliberate: it makes the new
+  field's zero value the pre-existing behaviour, and it is what `vinculum-bus`'s
+  `AutoReconnector` already means by the same number. "Do not reconnect at all" is
+  therefore not expressible here, as it is not there. `vinculum-mqtt` v0.11.0 adds the same
+  field with the same semantics.
+
+  The check sits at the top of the loop, before the attempt, so the limit counts attempts
+  made rather than waits endured: a limit of 3 dials the broker list three times and exits
+  before a fourth.
+
+  It governs **reconnection only** — the initial connection made by `Start` is unaffected,
+  since that path never enters the reconnect loop.
+
+  Giving up is terminal and quiet, mirroring `AutoReconnector`: an error is logged, the
+  supervision goroutine returns, and the client stays down without the process exiting.
+  Senders and receivers stay stopped, so publishes fail as they do for any disconnected
+  client.
+
 ## [0.3.0] - 2026-08-03
 
 ### Changed
