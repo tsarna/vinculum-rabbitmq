@@ -139,6 +139,66 @@ func TestReconnect_ContextCancelExitsBackoff(t *testing.T) {
 	assert.NotEmpty(t, spy.calls, "backoff should have been consulted at least once")
 }
 
+// countingBackoff returns a near-zero delay and runs a hook after each call, so
+// a test can end an otherwise unbounded loop deterministically rather than on a
+// timer.
+type countingBackoff struct {
+	calls []int
+	after func(call int)
+}
+
+func (b *countingBackoff) call(attempt int) time.Duration {
+	b.calls = append(b.calls, attempt)
+	if b.after != nil {
+		b.after(len(b.calls))
+	}
+	return time.Millisecond
+}
+
+func TestReconnect_GivesUpAtMaxAttempts(t *testing.T) {
+	spy := &countingBackoff{}
+	c := NewClient(Config{
+		ClientName:           "x",
+		Brokers:              []string{"amqp://127.0.0.1:1/"},
+		ReconnectBackoff:     spy.call,
+		MaxReconnectAttempts: 3,
+	})
+
+	// No cancellation anywhere: the limit alone has to end the loop, which is
+	// the whole point of the field.
+	conn, ok := c.reconnect(context.Background())
+	assert.Nil(t, conn)
+	assert.False(t, ok)
+
+	// A limit of 3 dials the broker list three times, so the backoff is
+	// consulted for attempts 0, 1 and 2 and the loop exits before a fourth dial.
+	assert.Equal(t, []int{0, 1, 2}, spy.calls)
+}
+
+// Zero is the Go zero value of the field, so it has to keep meaning "forever" —
+// otherwise adding the field would silently stop every existing client from
+// reconnecting.
+func TestReconnect_ZeroMaxAttemptsIsUnlimited(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	spy := &countingBackoff{after: func(call int) {
+		if call == 6 {
+			cancel() // well past any plausible small limit
+		}
+	}}
+	c := NewClient(Config{
+		ClientName:           "x",
+		Brokers:              []string{"amqp://127.0.0.1:1/"},
+		ReconnectBackoff:     spy.call,
+		MaxReconnectAttempts: 0,
+	})
+
+	conn, ok := c.reconnect(ctx)
+	assert.Nil(t, conn)
+	assert.False(t, ok)
+	assert.Equal(t, []int{0, 1, 2, 3, 4, 5}, spy.calls,
+		"kept retrying until the context was cancelled")
+}
+
 func TestStart_StateFlag_FlipsOnSuccess(t *testing.T) {
 	// Use a port that never connects so Start fails — we are only verifying
 	// the started flag transitions even on a failure path.

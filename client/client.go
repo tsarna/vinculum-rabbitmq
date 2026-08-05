@@ -365,6 +365,17 @@ func (c *Client) reconnect(ctx context.Context) (*amqp.Connection, bool) {
 			return nil, false
 		}
 
+		// Giving up is checked before the attempt rather than after the backoff
+		// so that MaxReconnectAttempts counts attempts made, not waits endured:
+		// a limit of 3 dials the broker list three times.
+		if max := c.cfg.MaxReconnectAttempts; max > 0 && attempt >= max {
+			c.cfg.Logger.Error("rabbitmq client: giving up reconnection attempts",
+				zap.String("client", c.cfg.ClientName),
+				zap.Int("attempts", attempt),
+				zap.Int("max_reconnect_attempts", max))
+			return nil, false
+		}
+
 		for _, url := range c.cfg.Brokers {
 			if ctx.Err() != nil {
 				return nil, false
