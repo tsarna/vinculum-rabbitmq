@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-25
+
+### Added
+
+- **`Client.IsConnected()`** reports whether the client currently holds a live
+  connection to a broker — `OnConnect` has fired without a subsequent
+  `OnDisconnect`. The state was already tracked internally to guarantee
+  `OnDisconnect` fires exactly once per cycle; this exposes it.
+
+  It exists for health reporting. A host that answers a readiness probe needs to
+  say "this process cannot do its job right now" while the broker is away, and
+  recover when the reconnect loop succeeds — which is precisely the window this
+  reports. It is a snapshot, not a guarantee: the connection may drop between
+  the call and the next publish, so it is useful for a probe and useless as a
+  precondition. Code that wants to publish should publish and handle the error.
+
 ## [0.4.0] - 2026-08-05
 
 ### Added
