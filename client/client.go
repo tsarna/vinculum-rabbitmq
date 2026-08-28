@@ -108,12 +108,34 @@ func (c *Client) IsConnected() bool {
 	return c.connected
 }
 
-// Start dials the first reachable broker, opens one channel per sender and
-// one per receiver, declares receiver topology, registers consumers, fires
-// OnConnect, and spawns the reconnect watcher goroutine.
+// Start launches the connection machinery and returns. It does not wait for a
+// broker to answer.
 //
-// Calling Start twice is an error.
+// A background goroutine dials the brokers list with backoff until one accepts,
+// opens one channel per sender and per receiver, declares receiver topology,
+// registers consumers, fires OnConnect, and then watches for the connection to
+// drop — at which point the same loop repairs it. The initial connection and a
+// reconnection are therefore the same code path, and a broker that is not
+// listening yet at process start is the same recoverable situation as one that
+// goes away later.
+//
+// Start used to dial synchronously and return the failure, which meant the
+// reconnect watcher was only ever spawned *after* a first success: a broker
+// that was down at startup left the client dead for the life of the process,
+// with the schedule its own Config described never running. It also made a
+// host's boot wait on a third party — the caller could only find out by
+// blocking.
+//
+// Errors returned here are configuration, not connectivity: no brokers, or a
+// second Start. Use IsConnected to observe the connection, and OnConnect /
+// OnDisconnect to react to it.
 func (c *Client) Start(ctx context.Context) error {
+	// Validated before any state is claimed, so a client that never launches
+	// its goroutine also never leaves Stop waiting on one.
+	if len(c.cfg.Brokers) == 0 {
+		return errors.New("rabbitmq client: no brokers configured")
+	}
+
 	c.mu.Lock()
 	if c.started {
 		c.mu.Unlock()
@@ -123,43 +145,32 @@ func (c *Client) Start(ctx context.Context) error {
 	lifeCtx, cancel := context.WithCancel(ctx)
 	c.lifeCtx = lifeCtx
 	c.cancelLife = cancel
-	c.mu.Unlock()
-
-	if len(c.cfg.Brokers) == 0 {
-		cancel()
-		return errors.New("rabbitmq client: no brokers configured")
-	}
-
-	conn, brokerURL, err := c.dial()
-	if err != nil {
-		cancel()
-		return err
-	}
-	c.cfg.Logger.Info("rabbitmq client: connected",
-		zap.String("client", c.cfg.ClientName),
-		zap.String("broker", redactURL(brokerURL)))
-
-	if err := c.setupChannels(lifeCtx, conn); err != nil {
-		_ = conn.Close()
-		cancel()
-		return err
-	}
-
-	c.mu.Lock()
-	c.conn = conn
-	c.connected = true
+	// Created here rather than on a successful connect, so Stop can wait for
+	// the goroutine to exit whether or not it ever reached a broker.
 	c.reconnectDone = make(chan struct{})
 	c.mu.Unlock()
 
-	c.metrics.SetConnected(lifeCtx, true)
-
-	closeNotif := conn.NotifyClose(make(chan *amqp.Error, 1))
-	go c.watchConnAndReconnect(lifeCtx, closeNotif)
-
-	if c.cfg.OnConnect != nil {
-		c.cfg.OnConnect(lifeCtx)
-	}
+	go c.connectAndWatch(lifeCtx)
 	return nil
+}
+
+// connectAndWatch establishes the first connection and then keeps it, for the
+// life of the client. It is the only goroutine that owns the connection.
+func (c *Client) connectAndWatch(ctx context.Context) {
+	defer func() {
+		c.mu.Lock()
+		done := c.reconnectDone
+		c.mu.Unlock()
+		if done != nil {
+			close(done)
+		}
+	}()
+
+	conn, ok := c.connect(ctx, true)
+	if !ok {
+		return // ctx cancelled before the first connection
+	}
+	c.watchConnAndReconnect(ctx, conn.NotifyClose(make(chan *amqp.Error, 1)))
 }
 
 // Stop tears down all consumers, channels, and the connection. Safe to call
@@ -306,16 +317,10 @@ func (c *Client) setupChannels(ctx context.Context, conn *amqp.Connection) error
 // channel; on close, fires OnDisconnect, tears down stale per-channel state,
 // reconnects with backoff, and arms the next NotifyClose. Exits when the
 // life context is cancelled (Stop was called).
+//
+// Called only from connectAndWatch, which owns the goroutine and closes
+// reconnectDone when this returns.
 func (c *Client) watchConnAndReconnect(ctx context.Context, closeNotif chan *amqp.Error) {
-	defer func() {
-		c.mu.Lock()
-		done := c.reconnectDone
-		c.mu.Unlock()
-		if done != nil {
-			close(done)
-		}
-	}()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -335,9 +340,9 @@ func (c *Client) watchConnAndReconnect(ctx context.Context, closeNotif chan *amq
 				zap.Error(amqpErr))
 			c.handleDisconnect(ctx)
 
-			newConn, ok := c.reconnect(ctx)
+			newConn, ok := c.connect(ctx, false)
 			if !ok {
-				return // ctx cancelled during reconnect
+				return // ctx cancelled, or the attempt limit was reached
 			}
 			closeNotif = newConn.NotifyClose(make(chan *amqp.Error, 1))
 		}
@@ -367,11 +372,23 @@ func (c *Client) handleDisconnect(ctx context.Context) {
 	}
 }
 
-// reconnect loops dialing brokers (walking the list in order each attempt)
-// with backoff between attempts. On a successful dial + channel setup, fires
-// OnConnect and returns the new connection. Returns false if ctx is
-// cancelled before a connection is established.
-func (c *Client) reconnect(ctx context.Context) (*amqp.Connection, bool) {
+// connect loops dialing brokers (walking the list in order each attempt) with
+// backoff between attempts. On a successful dial + channel setup, fires
+// OnConnect and returns the new connection. Returns false if ctx is cancelled
+// before a connection is established, or if the attempt limit was reached.
+//
+// initial distinguishes the first connection from a repair of a lost one. They
+// are the same work, and deliberately the same code — what differs is only how
+// each is accounted for and how long it is allowed to go on:
+//
+//   - MaxReconnectAttempts bounds a repair, never the first connection. It is
+//     documented as governing reconnection, and a broker that is not listening
+//     yet at process start is an ordinary situation rather than one to give up
+//     on — the host is reporting itself not-ready throughout, which is the
+//     honest thing to do about it and costs nothing to keep doing.
+//   - The reconnection counter is not incremented for a connection that was
+//     never lost, or every process start would record one.
+func (c *Client) connect(ctx context.Context, initial bool) (*amqp.Connection, bool) {
 	backoff := c.cfg.ReconnectBackoff
 	if backoff == nil {
 		backoff = DefaultReconnectBackoff
@@ -385,7 +402,7 @@ func (c *Client) reconnect(ctx context.Context) (*amqp.Connection, bool) {
 		// Giving up is checked before the attempt rather than after the backoff
 		// so that MaxReconnectAttempts counts attempts made, not waits endured:
 		// a limit of 3 dials the broker list three times.
-		if max := c.cfg.MaxReconnectAttempts; max > 0 && attempt >= max {
+		if max := c.cfg.MaxReconnectAttempts; !initial && max > 0 && attempt >= max {
 			c.cfg.Logger.Error("rabbitmq client: giving up reconnection attempts",
 				zap.String("client", c.cfg.ClientName),
 				zap.Int("attempts", attempt),
@@ -399,9 +416,10 @@ func (c *Client) reconnect(ctx context.Context) (*amqp.Connection, bool) {
 			}
 			conn, dialErr := c.dialOne(url)
 			if dialErr != nil {
-				c.cfg.Logger.Warn("rabbitmq client: reconnect dial failed",
+				c.cfg.Logger.Warn("rabbitmq client: dial failed",
 					zap.String("client", c.cfg.ClientName),
 					zap.String("broker", redactURL(url)),
+					zap.Bool("initial", initial),
 					zap.Error(dialErr))
 				continue
 			}
@@ -409,8 +427,9 @@ func (c *Client) reconnect(ctx context.Context) (*amqp.Connection, bool) {
 			// Got a connection. Setup channels — any failure here means we
 			// have a connection we can't use; close it and keep trying.
 			if setupErr := c.setupChannels(ctx, conn); setupErr != nil {
-				c.cfg.Logger.Warn("rabbitmq client: setup channels after reconnect failed",
+				c.cfg.Logger.Warn("rabbitmq client: setup channels failed",
 					zap.String("client", c.cfg.ClientName),
+					zap.Bool("initial", initial),
 					zap.Error(setupErr))
 				_ = conn.Close()
 				continue
@@ -422,9 +441,15 @@ func (c *Client) reconnect(ctx context.Context) (*amqp.Connection, bool) {
 			c.mu.Unlock()
 
 			c.metrics.SetConnected(ctx, true)
-			c.metrics.IncrReconnections(ctx)
+			if !initial {
+				c.metrics.IncrReconnections(ctx)
+			}
 
-			c.cfg.Logger.Info("rabbitmq client: reconnected",
+			msg := "rabbitmq client: reconnected"
+			if initial {
+				msg = "rabbitmq client: connected"
+			}
+			c.cfg.Logger.Info(msg,
 				zap.String("client", c.cfg.ClientName),
 				zap.String("broker", redactURL(url)),
 				zap.Int("attempt", attempt))
@@ -446,27 +471,6 @@ func (c *Client) reconnect(ctx context.Context) (*amqp.Connection, bool) {
 		case <-time.After(delay):
 		}
 	}
-}
-
-// dial walks the brokers list once and returns the first successful
-// connection. Used by Start; reconnect drives the brokers walk itself so it
-// can interleave backoff between attempts.
-func (c *Client) dial() (*amqp.Connection, string, error) {
-	var firstErr error
-	for _, url := range c.cfg.Brokers {
-		conn, err := c.dialOne(url)
-		if err == nil {
-			return conn, url, nil
-		}
-		c.cfg.Logger.Warn("rabbitmq client: dial failed",
-			zap.String("client", c.cfg.ClientName),
-			zap.String("broker", redactURL(url)),
-			zap.Error(err))
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-	return nil, "", fmt.Errorf("rabbitmq client %q: all brokers failed; first error: %w", c.cfg.ClientName, firstErr)
 }
 
 // dialOne dials a single broker URL with the configured AMQP options.

@@ -53,10 +53,15 @@ type Config struct {
 	// attempt. Also runs on graceful shutdown. May be nil.
 	OnDisconnect func(ctx context.Context)
 
-	// ReconnectBackoff maps the attempt number (0-based, starting from 0 on
-	// the first reconnect attempt after a disconnect) to a wait duration.
+	// ReconnectBackoff maps the attempt number (0-based) to a wait duration.
 	// A complete "attempt" is one full walk of the brokers list — the loop
 	// only consults this function after every broker has been tried once.
+	//
+	// It paces the initial connection as well as a reconnection: the two are
+	// the same loop, and a broker that has not finished starting deserves the
+	// same patience as one that went away. The count restarts at 0 for each,
+	// so a slow startup does not leave a later outage backing off from a large
+	// number.
 	//
 	// If nil, DefaultReconnectBackoff is used (1s initial, 60s max, ×2 per
 	// attempt). To disable backoff, return zero.
@@ -73,8 +78,11 @@ type Config struct {
 	// already means by the same number. "Do not reconnect at all" is therefore
 	// not expressible, there or here.
 	//
-	// It governs reconnection only — the initial connection made by Start is
-	// unaffected, since that path never enters the reconnect loop.
+	// It governs reconnection only. The initial connection now runs through the
+	// same loop, so this is an explicit exemption rather than a consequence of
+	// the code's shape: giving up on a broker that has not finished starting is
+	// the wrong default, and the host reports itself not-ready throughout,
+	// which is the honest thing to do about it and costs nothing to keep doing.
 	//
 	// Giving up is terminal and quiet: the client logs an error, the supervision
 	// goroutine returns, and the client stays down without the process exiting.

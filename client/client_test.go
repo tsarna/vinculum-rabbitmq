@@ -2,8 +2,7 @@ package client
 
 import (
 	"context"
-	"errors"
-	"strings"
+	"net"
 	"testing"
 	"time"
 
@@ -62,24 +61,6 @@ func TestStart_RejectsEmptyBrokers(t *testing.T) {
 	assert.Contains(t, err.Error(), "no brokers")
 }
 
-func TestStart_DialFailureBubblesUp(t *testing.T) {
-	// 127.0.0.1:1 is a port that's never open. Use a 50ms connect timeout
-	// so the test stays snappy.
-	c := NewClient(Config{
-		ClientName:        "x",
-		Brokers:           []string{"amqp://127.0.0.1:1/"},
-		ConnectionTimeout: 50 * time.Millisecond,
-	})
-
-	err := c.Start(context.Background())
-	require.Error(t, err)
-	assert.True(t, strings.Contains(err.Error(), "all brokers failed"),
-		"want 'all brokers failed' in error, got %q", err.Error())
-
-	// After a failed Start we must still be Stop-safe.
-	require.NoError(t, c.Stop())
-}
-
 func TestStart_DoubleStartIsAnError(t *testing.T) {
 	c := NewClient(Config{
 		ClientName:        "x",
@@ -87,10 +68,12 @@ func TestStart_DoubleStartIsAnError(t *testing.T) {
 		ConnectionTimeout: 50 * time.Millisecond,
 	})
 
-	// First Start fails (dial fails) but sets c.started=true.
-	_ = c.Start(context.Background())
+	t.Cleanup(func() { _ = c.Stop() })
 
-	// Second Start should report already-started, not retry.
+	// The first Start returns without waiting for a broker, and sets started.
+	require.NoError(t, c.Start(context.Background()))
+
+	// Second Start should report already-started, not launch a second loop.
 	err := c.Start(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already started")
@@ -133,7 +116,7 @@ func TestReconnect_ContextCancelExitsBackoff(t *testing.T) {
 		cancel()
 	}()
 
-	conn, ok := c.reconnect(ctx)
+	conn, ok := c.connect(ctx, false)
 	assert.Nil(t, conn)
 	assert.False(t, ok)
 	assert.NotEmpty(t, spy.calls, "backoff should have been consulted at least once")
@@ -166,7 +149,7 @@ func TestReconnect_GivesUpAtMaxAttempts(t *testing.T) {
 
 	// No cancellation anywhere: the limit alone has to end the loop, which is
 	// the whole point of the field.
-	conn, ok := c.reconnect(context.Background())
+	conn, ok := c.connect(context.Background(), false)
 	assert.Nil(t, conn)
 	assert.False(t, ok)
 
@@ -192,41 +175,147 @@ func TestReconnect_ZeroMaxAttemptsIsUnlimited(t *testing.T) {
 		MaxReconnectAttempts: 0,
 	})
 
-	conn, ok := c.reconnect(ctx)
+	conn, ok := c.connect(ctx, false)
 	assert.Nil(t, conn)
 	assert.False(t, ok)
 	assert.Equal(t, []int{0, 1, 2, 3, 4, 5}, spy.calls,
 		"kept retrying until the context was cancelled")
 }
 
-func TestStart_StateFlag_FlipsOnSuccess(t *testing.T) {
-	// Use a port that never connects so Start fails — we are only verifying
-	// the started flag transitions even on a failure path.
+// MaxReconnectAttempts bounds a repair, never the first connection. Config
+// documents it as governing reconnection, and a broker that is not listening
+// yet at process start is an ordinary situation rather than one to give up on —
+// the host reports itself not-ready throughout, which is the honest thing to do
+// and costs nothing to keep doing.
+func TestConnect_InitialIgnoresMaxAttempts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	spy := &countingBackoff{after: func(call int) {
+		if call == 6 {
+			cancel() // well past the limit of 3 below
+		}
+	}}
 	c := NewClient(Config{
-		ClientName:        "x",
-		Brokers:           []string{"amqp://127.0.0.1:1/"},
-		ConnectionTimeout: 50 * time.Millisecond,
+		ClientName:           "x",
+		Brokers:              []string{"amqp://127.0.0.1:1/"},
+		ReconnectBackoff:     spy.call,
+		MaxReconnectAttempts: 3,
 	})
 
-	require.False(t, c.started)
-	_ = c.Start(context.Background())
-	assert.True(t, c.started, "started flag must stick even on failed Start")
-
-	// connected must remain false after a failed dial.
-	assert.False(t, c.connected, "connected must be false when Start fails")
+	conn, ok := c.connect(ctx, true)
+	assert.Nil(t, conn)
+	assert.False(t, ok)
+	assert.Equal(t, []int{0, 1, 2, 3, 4, 5}, spy.calls,
+		"the initial connection retries past the limit that bounds a reconnect")
 }
 
-func TestStart_CleansUpOnFailure(t *testing.T) {
+func TestStart_MarksStartedWithoutConnecting(t *testing.T) {
+	// A port nothing is listening on: the client is started and trying, but
+	// has not connected and will not while this test runs.
 	c := NewClient(Config{
 		ClientName:        "x",
 		Brokers:           []string{"amqp://127.0.0.1:1/"},
 		ConnectionTimeout: 50 * time.Millisecond,
 	})
-	err := c.Start(context.Background())
-	require.Error(t, err)
+	t.Cleanup(func() { _ = c.Stop() })
 
-	// After a failed Start, lifeCtx should already be cancelled so a
-	// follow-up Stop() does not block.
+	require.False(t, c.started)
+	require.NoError(t, c.Start(context.Background()),
+		"an unreachable broker is not a Start failure; it is what the retry loop is for")
+	assert.True(t, c.started)
+	assert.False(t, c.IsConnected(), "connected must be false until a broker answers")
+}
+
+// The behaviour this restructure exists for. Start used to dial synchronously,
+// so a caller could only learn the broker was down by blocking on it — and the
+// reconnect watcher was spawned only after a first success, leaving the client
+// dead for the life of the process.
+func TestStart_DoesNotWaitForABroker(t *testing.T) {
+	c := NewClient(Config{
+		ClientName: "x",
+		// Several unreachable brokers, so a synchronous implementation would
+		// walk the whole list before returning.
+		Brokers: []string{
+			"amqp://127.0.0.1:1/",
+			"amqp://127.0.0.1:2/",
+			"amqp://127.0.0.1:3/",
+		},
+		ReconnectBackoff: func(int) time.Duration { return 10 * time.Millisecond },
+	})
+	t.Cleanup(func() { _ = c.Stop() })
+
+	done := make(chan error, 1)
+	go func() { done <- c.Start(context.Background()) }()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start blocked on brokers that are not listening")
+	}
+}
+
+// Start launching a *loop* is the whole fix, so this counts real TCP dials
+// rather than trusting that a goroutine exists. The listener accepts and
+// immediately closes, so every attempt gets a connection and then fails the
+// AMQP handshake — which is what a broker that is up but not ready looks like,
+// and exactly the case the old code turned into a permanent outage.
+//
+// Before the restructure this could not reach two: a failed first dial returned
+// from Start, and the watcher that would have retried was spawned only after a
+// success that never came.
+func TestStart_KeepsDialingAfterTheFirstFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	dials := make(chan struct{}, 16)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close() // fail the handshake
+			select {
+			case dials <- struct{}{}:
+			default:
+			}
+		}
+	}()
+
+	c := NewClient(Config{
+		ClientName:       "x",
+		Brokers:          []string{"amqp://" + ln.Addr().String() + "/"},
+		ReconnectBackoff: func(int) time.Duration { return 5 * time.Millisecond },
+	})
+	t.Cleanup(func() { _ = c.Stop() })
+
+	require.NoError(t, c.Start(context.Background()))
+
+	for i := 1; i <= 3; i++ {
+		select {
+		case <-dials:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only saw %d dial(s); the connect loop is not retrying", i-1)
+		}
+	}
+	assert.False(t, c.IsConnected(), "a closed connection is not a usable one")
+}
+
+// Stop has to end the connect loop as well as tear down. The loop is unbounded
+// for an initial connection, so without this a client that never reached a
+// broker would keep dialing for the life of the process.
+func TestStop_EndsAConnectThatNeverSucceeded(t *testing.T) {
+	c := NewClient(Config{
+		ClientName:       "x",
+		Brokers:          []string{"amqp://127.0.0.1:1/"},
+		ReconnectBackoff: func(int) time.Duration { return 10 * time.Millisecond },
+	})
+	require.NoError(t, c.Start(context.Background()))
+
+	// Let it get into the retry loop rather than catching it before it starts.
+	time.Sleep(50 * time.Millisecond)
+
 	done := make(chan struct{})
 	go func() {
 		_ = c.Stop()
@@ -235,8 +324,32 @@ func TestStart_CleansUpOnFailure(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("Stop after failed Start did not return promptly")
+		t.Fatal("Stop did not return promptly while the connect loop was running")
 	}
+}
+
+// Configuration, not connectivity: the two things Start can still refuse.
+func TestStart_RejectsAConfigurationItCannotUse(t *testing.T) {
+	c := NewClient(Config{ClientName: "x"})
+	assert.ErrorContains(t, c.Start(context.Background()), "no brokers configured")
+
+	// And rejecting it must not leave state behind that makes Stop wait for a
+	// goroutine no one launched.
+	done := make(chan struct{})
+	go func() {
+		_ = c.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Stop hung after a Start that never launched anything")
+	}
+
+	c2 := NewClient(Config{ClientName: "x", Brokers: []string{"amqp://127.0.0.1:1/"}})
+	t.Cleanup(func() { _ = c2.Stop() })
+	require.NoError(t, c2.Start(context.Background()))
+	assert.ErrorContains(t, c2.Start(context.Background()), "already started")
 }
 
 func TestRedactURL(t *testing.T) {
@@ -255,21 +368,10 @@ func TestRedactURL(t *testing.T) {
 	}
 }
 
-// Confirm that errors.As works with our wrapped errors (sanity check that
-// fmt.Errorf+"%w" is used uniformly).
-func TestStart_ErrorIsWrappedNotShadowed(t *testing.T) {
-	c := NewClient(Config{
-		ClientName:        "x",
-		Brokers:           []string{"amqp://127.0.0.1:1/"},
-		ConnectionTimeout: 50 * time.Millisecond,
-	})
-	err := c.Start(context.Background())
-	require.Error(t, err)
-	// The wrapped first dial error should be retrievable.
-	var netErr error
-	assert.True(t, errors.Unwrap(err) != nil, "Start error should wrap underlying dial error")
-	_ = netErr
-}
+// TestStart_ErrorIsWrappedNotShadowed is gone with the code path it checked.
+// It asserted that Start's returned dial error wrapped the underlying network
+// error; Start no longer dials, and the two errors it can still return are
+// configuration failures with nothing beneath them to wrap.
 
 // ─── channel-level recovery ──────────────────────────────────────────────────
 
@@ -347,21 +449,28 @@ func TestLifecycle_HooksNotFiredBeforeStart(t *testing.T) {
 	assert.Equal(t, 0, hc.disconnects)
 }
 
-func TestLifecycle_HooksNotFiredOnFailedStart(t *testing.T) {
+// The hooks describe transitions of a connection, so a client that never had
+// one must fire neither — however long it spends trying. The contract survives
+// the restructure unchanged; only the way the failure is reached has moved,
+// from a returned error to a retry loop that has not succeeded yet.
+func TestLifecycle_HooksNotFiredWithoutAConnection(t *testing.T) {
 	hc, onC, onD := newHookCounter()
 	c := NewClient(Config{
 		ClientName:        "x",
 		Brokers:           []string{"amqp://127.0.0.1:1/"},
 		ConnectionTimeout: 50 * time.Millisecond,
+		ReconnectBackoff:  func(int) time.Duration { return 10 * time.Millisecond },
 		OnConnect:         onC,
 		OnDisconnect:      onD,
 	})
-	err := c.Start(context.Background())
-	require.Error(t, err)
+	require.NoError(t, c.Start(context.Background()))
 
-	// Dial never succeeded → we were never "connected" → neither hook fires.
-	assert.Equal(t, 0, hc.connects, "OnConnect must not fire when Start fails")
-	assert.Equal(t, 0, hc.disconnects, "OnDisconnect must not fire when Start fails")
+	// Long enough for several failed attempts, so this is "never fired", not
+	// "not fired yet".
+	time.Sleep(100 * time.Millisecond)
+
+	assert.Equal(t, 0, hc.connects, "OnConnect must not fire without a connection")
+	assert.Equal(t, 0, hc.disconnects, "OnDisconnect must not fire without a connection")
 
 	// And a follow-up Stop must not fire it either.
 	require.NoError(t, c.Stop())

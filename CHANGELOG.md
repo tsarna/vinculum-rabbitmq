@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-28
+
+### Changed
+
+- **`Start` no longer dials. It launches the connection machinery and returns.**
+  A background goroutine walks the brokers list with backoff until one accepts,
+  sets up channels, fires `OnConnect`, and then watches for the connection to
+  drop — at which point the same loop repairs it.
+
+  This fixes a client that was permanently dead after a broker outage at startup.
+  `Start` dialed synchronously and returned the failure *before*
+  `go watchConnAndReconnect` was reached, so the reconnect watcher only ever
+  existed after a first success. A broker that was not listening yet left the
+  client dead for the life of the process, with the schedule `ReconnectBackoff`
+  and `MaxReconnectAttempts` describe never running at all. Measured with a
+  listener that accepts and closes: one dial before, unbounded retries after.
+
+  The initial connection and a repair are now literally the same function, which
+  is the point — a broker that is not up yet and one that went away are the same
+  situation, and were only ever different because of where the code sat.
+
+  **This is a breaking behavioural change for callers that relied on `Start`
+  reporting connectivity.** It now returns only for a configuration it cannot
+  use — no brokers, or a second `Start` — and never for a broker it cannot
+  reach. Use `IsConnected` to observe the connection and `OnConnect` /
+  `OnDisconnect` to react to it. A host that reports readiness needs no change:
+  `IsConnected` already said what it says now, for longer.
+
+- **`MaxReconnectAttempts` bounds a repair, never the first connection.** It is
+  documented as governing reconnection, and giving up on a broker that has not
+  finished starting is the wrong default — the host reports itself not-ready
+  throughout, which is the honest thing to do and costs nothing to keep doing.
+  A limit that also ended the initial connect would turn a slow broker into a
+  client that never connects and never says why.
+
+- The reconnection counter is no longer incremented for the first connection,
+  which was never lost. Every process start used to record one.
+
 ## [0.5.0] - 2026-08-25
 
 ### Added
