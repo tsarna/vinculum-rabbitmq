@@ -41,7 +41,25 @@
 //
 // # Acknowledgement
 //
-// With AutoAck=false (default), each message is acked after subscriber.OnEvent
-// returns without error. On error the message is nacked without requeue
-// (forwarded to a dead-letter exchange if the queue has one configured).
+// WithAckMode says who settles a delivery, and when. Under AckAfterHandling
+// (the default) each message is acked once subscriber.OnEvent returns without
+// error; on error it is nacked without requeue, so it is forwarded to a
+// dead-letter exchange if the queue has one configured and dropped if it does
+// not.
+//
+// Under AckManual nothing is settled when handling returns. Each delivery
+// carries a bus.Settler on its context — see bus.SettlerFromContext — so work
+// that finishes several hops later, behind an async queue or on another
+// goroutine, can settle the delivery it actually handled. A message that never
+// reaches the subscriber (one that fails to decode, or that no subscription
+// matched under an "error" default transform) is still nacked here, because the
+// consumer of the delivery cannot answer for a delivery it never saw.
+//
+// AckNone is AMQP's own no-ack consumer mode: the broker treats a message as
+// delivered the moment it sends it, this receiver acknowledges nothing, and
+// deliveries carry no settler.
+//
+// A delivery tag means nothing once its channel is gone, so a settler stamps
+// the channel generation it was built under and refuses afterwards, reporting a
+// bus.StaleError rather than issuing a call the broker would reject.
 package receiver

@@ -20,7 +20,7 @@ type ReceiverBuilder struct {
 	defaultXform   DefaultRoutingKeyTransform
 	prefetch       int
 	exclusive      bool
-	autoAck        bool
+	ackMode        AckMode
 	wireFormat     wire.WireFormat
 	onDecodeError  wire.DecodeErrorHook
 	consumerTag    string
@@ -32,7 +32,8 @@ type ReceiverBuilder struct {
 }
 
 // NewReceiver returns a ReceiverBuilder with default settings:
-// default_routing_key_transform=dot_to_slash, prefetch=10, auto_ack=false.
+// default_routing_key_transform=dot_to_slash, prefetch=10,
+// ack mode=AckAfterHandling.
 func NewReceiver() *ReceiverBuilder {
 	return &ReceiverBuilder{
 		defaultXform: DefaultRKDotToSlash,
@@ -91,11 +92,11 @@ func (b *ReceiverBuilder) WithExclusive(v bool) *ReceiverBuilder {
 	return b
 }
 
-// WithAutoAck sets the AMQP auto_ack consumer flag. When true, the broker
-// considers messages delivered as soon as they are sent over TCP (lossy on
-// crash). Default: false (manual ack after subscriber.OnEvent returns).
-func (b *ReceiverBuilder) WithAutoAck(v bool) *ReceiverBuilder {
-	b.autoAck = v
+// WithAckMode sets who settles a delivery with the broker, and when. Default:
+// AckAfterHandling, which acknowledges once subscriber.OnEvent has returned
+// without error.
+func (b *ReceiverBuilder) WithAckMode(m AckMode) *ReceiverBuilder {
+	b.ackMode = m
 	return b
 }
 
@@ -195,7 +196,7 @@ func (b *ReceiverBuilder) Build() (*RMQReceiver, error) {
 		defaultXform:   b.defaultXform,
 		prefetch:       b.prefetch,
 		exclusive:      b.exclusive,
-		autoAck:        b.autoAck,
+		ackMode:        b.ackMode,
 		wireFormat:     b.wireFormat,
 		onDecodeError:  b.onDecodeError,
 		consumerTag:    b.consumerTag,

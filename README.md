@@ -78,7 +78,8 @@ Consumes messages from a single AMQP queue and dispatches them as vinculum event
 - Default transforms when no subscription pattern matches: `dot_to_slash` (default), `verbatim`, `error`, `ignore`.
 - Payload deserialization via `wire.WireFormat` (default: `wire.Auto`). On deserialize error the receiver currently falls back to raw bytes (see [the JSON-FAIL-SPEC](https://github.com/tsarna/vinculum/blob/main/specs/JSON-FAIL-SPEC.md) in the main repo for proposed handling).
 - AMQP headers merged into the vinculum fields map (with W3C trace headers stripped after the propagator extracts them).
-- At-least-once delivery: with `AutoAck=false` (default) each message is acked after `subscriber.OnEvent` returns without error; on error it is nacked **without** requeue (forwarded to a DLX if the queue has one configured).
+- At-least-once delivery: with `WithAckMode(receiver.AckAfterHandling)` (the default) each message is acked after `subscriber.OnEvent` returns without error; on error it is nacked **without** requeue (forwarded to a DLX if the queue has one configured).
+- `WithAckMode(receiver.AckManual)` settles nothing when handling returns: each delivery carries a `bus.Settler` on its context, so work finishing several hops later — behind an async queue, on another goroutine — settles the delivery it actually handled. `receiver.AckNone` is AMQP's own no-ack mode, where the broker settles on send and nothing is acknowledged at all.
 - Configurable `Prefetch` (default 10) caps in-flight unacked messages.
 - W3C trace context extracted from headers; a new-root `SpanKindConsumer` span linked to the producer span covers `subscriber.OnEvent` (OTel async-messaging convention).
 

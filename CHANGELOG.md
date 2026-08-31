@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Manual acknowledgement.** Each delivery now carries a `bus.Settler` on its
+  context, so work that finishes several hops from the receiver — behind an
+  async queue, on another goroutine, in a subscription on a bus downstream —
+  settles the delivery it actually handled:
+
+  ```go
+  if s := bus.SettlerFromContext(ctx); s != nil {
+      settled, err := s.Ack(ctx)
+  }
+  ```
+
+  Acknowledgement is a property of the inbound delivery, and there was no way to
+  express that: an `amqp.Delivery` never left the receiver, and the vinculum
+  `fields` map cannot carry one, being rewritten per subscription with that
+  subscription's own topic captures. The context is the per-message channel that
+  survives every hop, and `context.WithoutCancel` means an async queue preserves
+  it across the goroutine boundary.
+
+  Settle-once, staleness, and the bool return come from `bus.NewSettler`, so
+  they are not written once per protocol, subtly differently. Two subscribers
+  both acknowledging produce one broker acknowledgement: the first call reports
+  `true`, the second `false`.
+
+- **A delivery tag is refused once its channel is gone.** A tag only means
+  something on the channel that issued it, and AMQP re-points tags from 1 on
+  each new channel. Each settler stamps the channel generation it was built
+  under and reports a `bus.StaleError` — "channel reconnected" — rather than
+  issuing a call the broker would reject with an error saying nothing about what
+  became of the message. The generation changes in `Stop`, after the delivery
+  loop has drained, so a message being handled when shutdown began still
+  acknowledges normally.
+
+### Changed
+
+- **`WithAutoAck(bool)` is replaced by `WithAckMode(AckMode)`**, with three
+  values where there were two: `AckAfterHandling` (the default, and exactly what
+  `WithAutoAck(false)` did — acknowledge once `subscriber.OnEvent` returns
+  without error), `AckManual` (settle nothing; the context's settler decides),
+  and `AckNone` (AMQP's own no-ack consumer flag, what `WithAutoAck(true)` did).
+
+  A boolean could not name the third state, and the two it did name were not
+  opposites: one is a vinculum policy about when to acknowledge, the other is a
+  broker mode in which nothing is ever acknowledged at all.
+
+  **Breaking for callers of `WithAutoAck`**: `WithAutoAck(true)` becomes
+  `WithAckMode(receiver.AckNone)`, and `WithAutoAck(false)` is the default and
+  can be dropped.
+
+- Every acknowledgement now goes through the settler, automatic ones included,
+  so "the receiver acknowledges for you" is one policy over one mechanism rather
+  than a second route to the broker — and a handler that settled the message
+  itself is not settled over the top of. A delivery that never reaches the
+  subscriber (one that fails to decode, one no subscription matched under the
+  `error` default transform) is still nacked by the receiver in every mode,
+  because the consumer of a delivery cannot answer for one it never saw.
+
+- Requires `github.com/tsarna/vinculum-bus` v0.18.0, for `Settler`, `SettleOps`,
+  `NewSettler`, and `StaleError`.
+
 ## [0.6.0] - 2026-08-28
 
 ### Changed

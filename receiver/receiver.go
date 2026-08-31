@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -62,7 +63,7 @@ type RMQReceiver struct {
 	defaultXform  DefaultRoutingKeyTransform
 	prefetch      int
 	exclusive     bool
-	autoAck       bool
+	ackMode       AckMode
 	wireFormat    wire.WireFormat
 	onDecodeError wire.DecodeErrorHook
 	consumerTag   string
@@ -77,6 +78,13 @@ type RMQReceiver struct {
 	mu       sync.Mutex
 	cancel   context.CancelFunc
 	loopDone chan struct{}
+
+	// epoch identifies the channel deliveries are currently arriving on. A
+	// delivery tag only means anything on the channel that issued it, so a
+	// settler stamps the epoch it was built under and refuses once it has
+	// moved. Stop is the only place it changes, because a receiver's channel is
+	// only ever replaced across one.
+	epoch atomic.Uint64
 }
 
 // Queue returns the AMQP queue this receiver consumes from.
@@ -129,7 +137,7 @@ func (r *RMQReceiver) Start(ctx context.Context, ch channel) error {
 		}
 	}
 
-	deliveries, err := ch.Consume(r.queue, r.consumerTag, r.autoAck, r.exclusive, false, false, nil)
+	deliveries, err := ch.Consume(r.queue, r.consumerTag, r.ackMode == AckNone, r.exclusive, false, false, nil)
 	if err != nil {
 		return fmt.Errorf("rabbitmq receiver: consume %q: %w", r.queue, err)
 	}
@@ -166,6 +174,14 @@ func (r *RMQReceiver) Stop() {
 	if done != nil {
 		<-done
 	}
+
+	// After the loop has drained, not before. Waiting for it means a delivery
+	// still being handled synchronously when Stop was called acknowledges
+	// normally, which is what makes an ordinary shutdown not redeliver its last
+	// message. Only a settle arriving after handling has finished — one held by
+	// an async queue, or by a configuration settling on its own schedule — sees
+	// the new epoch, and for that one the tag really is gone.
+	r.epoch.Add(1)
 }
 
 // runLoop reads deliveries until ctx is cancelled or the deliveries channel
@@ -201,23 +217,30 @@ func (r *RMQReceiver) handleDelivery(ctx context.Context, d amqp.Delivery) {
 	ctx = otel.GetTextMapPropagator().Extract(ctx, carrier.New(d.Headers))
 	remoteSpanCtx := trace.SpanContextFromContext(ctx)
 
+	// One settler per delivery, built before anything can fail, so that every
+	// path out of here settles through the same object. Automatic
+	// acknowledgement is then one policy over one mechanism rather than a
+	// second route to the broker, and a configuration that settled the message
+	// itself is not settled over the top of.
+	settler := r.newSettler(d)
+
 	vinculumTopic, fields, sub, fallbackAction, err := r.resolveTopicPart1(d.RoutingKey)
 	if err != nil {
 		r.logger.Error("rabbitmq receiver: routing", zap.String("routing_key", d.RoutingKey), zap.Error(err))
 		r.metrics.RecordReceived(ctx, r.queue, "routing")
-		r.nack(d)
+		r.nack(ctx, settler)
 		return
 	}
 	switch fallbackAction {
 	case fallbackIgnore:
 		r.metrics.RecordReceived(ctx, r.queue, "") // pulled, intentionally dropped
-		r.ack(d)
+		r.ack(ctx, settler)
 		return
 	case fallbackError:
 		r.logger.Error("rabbitmq receiver: no subscription matched and default_routing_key_transform is error",
 			zap.String("routing_key", d.RoutingKey))
 		r.metrics.RecordReceived(ctx, r.queue, "no_subscription")
-		r.nack(d)
+		r.nack(ctx, settler)
 		return
 	}
 
@@ -260,7 +283,7 @@ func (r *RMQReceiver) handleDelivery(ctx context.Context, d amqp.Delivery) {
 					},
 				})
 			}
-			r.nack(d)
+			r.nack(ctx, settler)
 			return
 		}
 	}
@@ -275,7 +298,7 @@ func (r *RMQReceiver) handleDelivery(ctx context.Context, d amqp.Delivery) {
 					zap.String("routing_key", d.RoutingKey),
 					zap.Error(terr))
 				r.metrics.RecordReceived(ctx, r.queue, "vinculum_topic")
-				r.nack(d)
+				r.nack(ctx, settler)
 				return
 			}
 			if t != "" {
@@ -313,6 +336,15 @@ func (r *RMQReceiver) handleDelivery(ctx context.Context, d amqp.Delivery) {
 	ctx, span := tp.Tracer("vinculum-rabbitmq/receiver").Start(ctx, "process "+vinculumTopic, spanOpts...)
 	defer span.End()
 
+	// Acknowledgement is a property of this delivery, and `fields` cannot carry
+	// it — the bus rewrites those per subscription with that subscription's own
+	// topic captures. The context can, and its values survive the async queue's
+	// goroutine hop, so putting the settler here is what lets a subscription
+	// several bus hops downstream acknowledge the message it handled.
+	if settler != nil {
+		ctx = bus.WithSettler(ctx, settler)
+	}
+
 	start := time.Now()
 	err = r.subscriber.OnEvent(ctx, vinculumTopic, msg, mergedFields)
 	elapsed := time.Since(start)
@@ -326,12 +358,18 @@ func (r *RMQReceiver) handleDelivery(ctx context.Context, d amqp.Delivery) {
 		span.SetStatus(codes.Error, "subscriber")
 		r.metrics.RecordProcessDuration(ctx, r.queue, elapsed, "subscriber")
 		r.metrics.RecordReceived(ctx, r.queue, "subscriber")
-		r.nack(d)
+		// Nacked in manual mode too. Handling failed, and the settler makes
+		// this a no-op if the configuration already settled the message — so
+		// the choice is between dead-lettering a known failure now and holding
+		// a prefetch slot until settle_timeout says the same thing later.
+		r.nack(ctx, settler)
 		return
 	}
 	r.metrics.RecordProcessDuration(ctx, r.queue, elapsed, "")
 	r.metrics.RecordReceived(ctx, r.queue, "")
-	r.ack(d)
+	if r.ackMode == AckAfterHandling {
+		r.ack(ctx, settler)
+	}
 }
 
 // fallbackAction encodes what to do when no Subscription matched. It is set
@@ -366,29 +404,6 @@ func (r *RMQReceiver) resolveTopicPart1(routingKey string) (vinculumTopic string
 		return "", nil, nil, fallbackIgnore, nil
 	}
 	return dotToSlash(routingKey), nil, nil, fallbackNone, nil
-}
-
-func (r *RMQReceiver) ack(d amqp.Delivery) {
-	if r.autoAck {
-		return
-	}
-	if err := d.Ack(false); err != nil {
-		r.logger.Warn("rabbitmq receiver: ack failed", zap.Error(err))
-	}
-}
-
-func (r *RMQReceiver) nack(d amqp.Delivery) {
-	if r.autoAck {
-		return
-	}
-	// requeue=false: never re-deliver a poison message in a tight loop. A
-	// consistently-failing message would otherwise be redelivered immediately
-	// and burn CPU; with requeue=false it is dropped (or dead-lettered if the
-	// queue has a DLX configured).
-	if err := d.Nack(false, false); err != nil {
-		r.logger.Warn("rabbitmq receiver: nack failed", zap.Error(err))
-	}
-	r.metrics.RecordNack(context.Background(), r.queue)
 }
 
 func dotToSlash(routingKey string) string {

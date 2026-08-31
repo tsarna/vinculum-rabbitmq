@@ -278,12 +278,14 @@ func TestStart_QoSAndConsume(t *testing.T) {
 	assert.False(t, fc.lastConsumeArgs.exclusive)
 }
 
-func TestStart_ExclusiveAndAutoAck(t *testing.T) {
+// AckNone is the one mode that reaches the broker as AMQP's own auto_ack
+// consumer flag. The other two settle from this side, so the flag stays off.
+func TestStart_ExclusiveAndAckNone(t *testing.T) {
 	r, err := NewReceiver().
 		WithQueue("q").
 		WithSubscriber(&fakeSubscriber{}).
 		WithExclusive(true).
-		WithAutoAck(true).
+		WithAckMode(AckNone).
 		Build()
 	require.NoError(t, err)
 
@@ -293,6 +295,21 @@ func TestStart_ExclusiveAndAutoAck(t *testing.T) {
 
 	assert.True(t, fc.lastConsumeArgs.exclusive)
 	assert.True(t, fc.lastConsumeArgs.autoAck)
+}
+
+func TestStart_ManualDoesNotSetAmqpAutoAck(t *testing.T) {
+	r, err := NewReceiver().
+		WithQueue("q").
+		WithSubscriber(&fakeSubscriber{}).
+		WithAckMode(AckManual).
+		Build()
+	require.NoError(t, err)
+
+	fc := &fakeChannel{}
+	require.NoError(t, r.Start(context.Background(), fc))
+	defer r.Stop()
+
+	assert.False(t, fc.lastConsumeArgs.autoAck)
 }
 
 func TestStart_RejectsDoubleStart(t *testing.T) {

@@ -406,12 +406,12 @@ func TestHandleDelivery_AutoWireFormatToleratesNonJSON(t *testing.T) {
 	assert.Equal(t, 0, ack.nacks)
 }
 
-func TestHandleDelivery_AutoAckSkipsAckCall(t *testing.T) {
+func TestHandleDelivery_AckNoneSkipsAckCall(t *testing.T) {
 	sub := &fakeSubscriber{}
 	r, err := NewReceiver().
 		WithQueue("q").
 		WithSubscriber(sub).
-		WithAutoAck(true).
+		WithAckMode(AckNone).
 		Build()
 	require.NoError(t, err)
 
@@ -423,12 +423,12 @@ func TestHandleDelivery_AutoAckSkipsAckCall(t *testing.T) {
 	assert.Equal(t, 0, ack.nacks)
 }
 
-func TestHandleDelivery_AutoAckSkipsNackOnError(t *testing.T) {
+func TestHandleDelivery_AckNoneSkipsNackOnError(t *testing.T) {
 	sub := &fakeSubscriber{returnErr: errors.New("boom")}
 	r, err := NewReceiver().
 		WithQueue("q").
 		WithSubscriber(sub).
-		WithAutoAck(true).
+		WithAckMode(AckNone).
 		Build()
 	require.NoError(t, err)
 
