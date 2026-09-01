@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-01
+
 ### Changed
 
 - **`AckAfterHandling` acknowledges when the work finishes, not when delivery
