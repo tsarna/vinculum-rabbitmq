@@ -114,11 +114,22 @@ func (o *deliverySettleOps) Valid() (bool, string) {
 // answer for. A nil settler is never put on a context, so inbound::ack() on
 // such a message reports false — which is the honest answer rather than a
 // successful-looking no-op.
+// Under AckAfterHandling the settler is marked as settled by the framework,
+// which is the same mode this receiver has always had and a different thing to
+// do with it. It used to mean "acknowledge once delivery returns", which is
+// exact only while delivery is synchronous — a queue or a bus hop downstream
+// returns as soon as the message is enqueued. Now it means "whoever finishes
+// the work settles this", and the acknowledgement follows the work however many
+// hops away it happens.
 func (r *RMQReceiver) newSettler(d amqp.Delivery) bus.Settler {
 	if r.ackMode == AckNone {
 		return nil
 	}
-	return bus.NewSettler(&deliverySettleOps{r: r, d: d, epoch: r.epoch.Load()})
+	ops := &deliverySettleOps{r: r, d: d, epoch: r.epoch.Load()}
+	if r.ackMode == AckAfterHandling {
+		return bus.NewSettler(ops, bus.AutoSettle())
+	}
+	return bus.NewSettler(ops)
 }
 
 // ack settles a delivery this receiver is answering for itself. A nil settler

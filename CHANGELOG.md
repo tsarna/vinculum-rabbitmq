@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`AckAfterHandling` acknowledges when the work finishes, not when delivery
+  returns.** The two are the same thing only while delivery is synchronous. Put
+  an async queue, a bus hop, or a state machine downstream and delivery returns
+  the moment the delivery is *enqueued* — so it was acknowledged before
+  anything had handled it, and a handler that then failed had nothing left to
+  redeliver or dead-letter.
+
+  The receiver now marks its settler as framework-settled and lets whatever
+  finishes the work settle it, however many hops away that happens. This makes
+  `queue_size` alongside automatic acknowledgement correct, where before it was
+  a way to lose messages. It matters most here: an unsettled delivery holds a
+  prefetch slot and nothing on this transport self-heals.
+
+  The mode keeps its name. What changed is when it acts, not what it means.
+
+- **A handler failure nacks in every mode, which is now the general rule rather
+  than this receiver's local one.** The reasoning is unchanged and was written
+  here first: an unsettled delivery under manual is bounded by a settle
+  deadline whose expiry nacks anyway, so the choice is between dead-lettering a
+  known failure now and holding a prefetch slot until the deadline says the
+  same thing later. `vinculum-bus` applies it at every settle point.
+
 ## [0.7.0] - 2026-08-31
 
 ### Added

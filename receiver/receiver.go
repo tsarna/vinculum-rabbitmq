@@ -348,6 +348,19 @@ func (r *RMQReceiver) handleDelivery(ctx context.Context, d amqp.Delivery) {
 	start := time.Now()
 	err = r.subscriber.OnEvent(ctx, vinculumTopic, msg, mergedFields)
 	elapsed := time.Since(start)
+
+	// The settle point. Under AckAfterHandling this acknowledges a subscriber
+	// that handled the delivery and leaves one that only queued it to settle at
+	// its own completion; a failure nacks in every mode, because an unsettled
+	// delivery is bounded by a settle deadline whose expiry nacks anyway — so
+	// the choice is between dead-lettering a known failure now and holding a
+	// prefetch slot until the deadline says the same thing later.
+	//
+	// It runs through the same settler a subscriber would have used, so a
+	// configuration that settled the message itself does not have it settled
+	// twice.
+	bus.SettleOnReturn(ctx, r.subscriber, err)
+
 	if err != nil {
 		r.logger.Error("rabbitmq receiver: subscriber.OnEvent",
 			zap.String("routing_key", d.RoutingKey),
@@ -358,18 +371,10 @@ func (r *RMQReceiver) handleDelivery(ctx context.Context, d amqp.Delivery) {
 		span.SetStatus(codes.Error, "subscriber")
 		r.metrics.RecordProcessDuration(ctx, r.queue, elapsed, "subscriber")
 		r.metrics.RecordReceived(ctx, r.queue, "subscriber")
-		// Nacked in manual mode too. Handling failed, and the settler makes
-		// this a no-op if the configuration already settled the message — so
-		// the choice is between dead-lettering a known failure now and holding
-		// a prefetch slot until settle_timeout says the same thing later.
-		r.nack(ctx, settler)
 		return
 	}
 	r.metrics.RecordProcessDuration(ctx, r.queue, elapsed, "")
 	r.metrics.RecordReceived(ctx, r.queue, "")
-	if r.ackMode == AckAfterHandling {
-		r.ack(ctx, settler)
-	}
 }
 
 // fallbackAction encodes what to do when no Subscription matched. It is set
