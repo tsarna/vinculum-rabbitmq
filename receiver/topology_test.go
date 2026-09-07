@@ -16,36 +16,45 @@ import (
 type fakeChannel struct {
 	mu sync.Mutex
 
-	qosCalls       int
-	lastPrefetch   int
-	lastGlobal     bool
-	qosErr         error
+	qosCalls     int
+	lastPrefetch int
+	lastGlobal   bool
+	qosErr       error
 
-	consumeCalls   int
-	deliveriesChan chan amqp.Delivery
-	consumeErr     error
+	consumeCalls    int
+	deliveriesChan  chan amqp.Delivery
+	consumeErr      error
 	lastConsumeArgs consumeArgs
 
-	declareCalls   []declareArgs
-	declareErr     error
-	declareReturn  amqp.Queue
+	cancelCalls   int
+	lastCancelled string
+	cancelErr     error
+	// cancelBlock, when set, holds Cancel until it is closed — which is what a
+	// broker that has stopped answering does, since basic.cancel waits for
+	// basic.cancel-ok and the library gives up only when the heartbeat reader
+	// does.
+	cancelBlock chan struct{}
 
-	passiveCalls   []declareArgs
-	passiveErr     error
-	passiveReturn  amqp.Queue
+	declareCalls  []declareArgs
+	declareErr    error
+	declareReturn amqp.Queue
+
+	passiveCalls  []declareArgs
+	passiveErr    error
+	passiveReturn amqp.Queue
 
 	bindCalls []bindArgs
 	bindErr   error
 }
 
 type consumeArgs struct {
-	queue, consumer string
+	queue, consumer                     string
 	autoAck, exclusive, noLocal, noWait bool
 }
 
 type declareArgs struct {
-	name                                    string
-	durable, autoDelete, exclusive, noWait  bool
+	name                                   string
+	durable, autoDelete, exclusive, noWait bool
 }
 
 type bindArgs struct {
@@ -60,6 +69,31 @@ func (f *fakeChannel) Qos(prefetchCount, prefetchSize int, global bool) error {
 	f.lastPrefetch = prefetchCount
 	f.lastGlobal = global
 	return f.qosErr
+}
+
+// Cancel withdraws the consumer, and closes the delivery channel behind
+// whatever is already buffered on it — which is what a real broker does, and
+// what lets a drain finish the prefetched backlog rather than abandon it.
+func (f *fakeChannel) Cancel(consumer string, _ bool) error {
+	f.mu.Lock()
+	block := f.cancelBlock
+	f.mu.Unlock()
+	if block != nil {
+		<-block
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelCalls++
+	f.lastCancelled = consumer
+	if f.cancelErr != nil {
+		return f.cancelErr
+	}
+	if f.deliveriesChan != nil {
+		close(f.deliveriesChan)
+		f.deliveriesChan = nil
+	}
+	return nil
 }
 
 func (f *fakeChannel) Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error) {

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	bus "github.com/tsarna/vinculum-bus"
@@ -28,6 +29,9 @@ import (
 type channel interface {
 	Qos(prefetchCount, prefetchSize int, global bool) error
 	Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error)
+	// Cancel withdraws the consumer, which is how a receiver stops being sent
+	// deliveries without giving up the channel it settles over. See Drain.
+	Cancel(consumer string, noWait bool) error
 	QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (amqp.Queue, error)
 	QueueDeclarePassive(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (amqp.Queue, error)
 	QueueBind(name, key, exchange string, noWait bool, args amqp.Table) error
@@ -75,16 +79,85 @@ type RMQReceiver struct {
 	tracerProvider trace.TracerProvider
 	metrics        *ReceiverMetrics
 
+	// Two cancels, because stopping is two things and a graceful shutdown wants
+	// them apart. stopRead is the fallback way to end the delivery loop;
+	// stopWork cancels the context every delivery and every settle rides on,
+	// and so is the one that ends the receiver. stopRead's context is derived
+	// from stopWork's, so cancelling work ends reading too.
+	//
+	// ch is kept because draining needs it: withdrawing the consumer is an
+	// operation on the channel, and it is the one way to stop being sent
+	// deliveries while keeping the channel that their acknowledgements travel
+	// over. Nothing else here touches it — the client owns opening and closing.
 	mu       sync.Mutex
-	cancel   context.CancelFunc
+	stopRead context.CancelFunc
+	stopWork context.CancelFunc
 	loopDone chan struct{}
+	ch       channel
+	// activeTag is the consumer tag this cycle registered under, which is what
+	// Drain withdraws. It differs from consumerTag when nothing configured one.
+	activeTag string
 
 	// epoch identifies the channel deliveries are currently arriving on. A
 	// delivery tag only means anything on the channel that issued it, so a
 	// settler stamps the epoch it was built under and refuses once it has
 	// moved. Stop is the only place it changes, because a receiver's channel is
-	// only ever replaced across one.
+	// only ever replaced across one — and Drain is deliberately not such a
+	// place, which is the whole of what draining adds here.
 	epoch atomic.Uint64
+
+	// unsettled counts deliveries handed out and not yet acknowledged, nacked,
+	// or abandoned. See Unsettled.
+	unsettled atomic.Int64
+
+	// drained says this receiver has been told to stop consuming, and is the
+	// reason Start refuses afterwards. It is set under mu, which is what makes
+	// it a guarantee rather than a hint: the client's own connect and recovery
+	// paths decide whether to start a receiver and then start it, and a drain
+	// landing between those two steps would otherwise slip through and register
+	// the consumer again — during the phase that waits for it to have finished.
+	// Taking the decision and the registration under one lock is what closes
+	// that window.
+	drained bool
+
+	// stillDelivering is the channel a timed-out Drain was waiting on, closed
+	// when the loop finally finishes. Nil until the first drain, and set by
+	// every drain rather than only by one that gives up — what makes it answer
+	// "no" is the channel being closed, not the field being absent.
+	//
+	// A channel rather than a flag because the question is asked a phase later
+	// and the answer moves in between: teardown runs a whole quiesce between
+	// Drain and Stop, so a delivery that overran the drain's deadline by a
+	// moment has very likely finished by the time Stop looks. A flag would say
+	// otherwise and put an error in the log of a shutdown where nothing went
+	// wrong. See stillRunning.
+	stillDelivering atomic.Pointer[chan struct{}]
+}
+
+// Unsettled reports how many deliveries this receiver has handed out that
+// nothing has settled yet.
+//
+// It is not the number of unacknowledged deliveries the broker is holding. A
+// delivery this receiver has given up on — one whose channel went away, taking
+// the only tag that could have acknowledged it — is the broker's business, and
+// nothing in this process is going to settle it. What this counts is the
+// narrower thing a shutdown can usefully wait for: settles that are still
+// coming.
+func (r *RMQReceiver) Unsettled() int { return int(r.unsettled.Load()) }
+
+// stillRunning reports whether a delivery a drain gave up on is running *now*,
+// rather than whether one ever was.
+func (r *RMQReceiver) stillRunning() bool {
+	ch := r.stillDelivering.Load()
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-*ch:
+		return false
+	default:
+		return true
+	}
 }
 
 // Queue returns the AMQP queue this receiver consumes from.
@@ -125,7 +198,27 @@ func (r *RMQReceiver) DeclareTopology(ch channel) error {
 // A second call to Start without an intervening Stop is an error.
 func (r *RMQReceiver) Start(ctx context.Context, ch channel) error {
 	r.mu.Lock()
-	if r.cancel != nil {
+	// Refused after a drain, whether or not this receiver had started when the
+	// drain reached it. A reconnect or a channel recovery ends here, and both
+	// stay live until the connection is closed — so without this a shutdown
+	// could go back to consuming after it had reported that it had stopped.
+	//
+	// It also covers the loop a timed-out Stop abandoned, which is the other
+	// reason not to start again: that loop still owns loopDone, and a second
+	// one over the top would leave two consumers on one channel and this
+	// cycle's Stop waiting forever on the abandoned one. There is no way to
+	// reach that state except through a Drain — a Stop with no drain before it
+	// always waits — so this one flag answers for both, and a separate check on
+	// the abandoned loop would be unreachable.
+	// Checked before "already started", because after a drain it is the more
+	// specific and more useful answer: a drained receiver is still started
+	// until Stop runs, and reporting that would send a caller looking for a
+	// double-Start that did not happen.
+	if r.drained {
+		r.mu.Unlock()
+		return fmt.Errorf("rabbitmq receiver: drained, not restarting for queue %q", r.queue)
+	}
+	if r.stopWork != nil {
 		r.mu.Unlock()
 		return fmt.Errorf("rabbitmq receiver: already started for queue %q", r.queue)
 	}
@@ -137,40 +230,234 @@ func (r *RMQReceiver) Start(ctx context.Context, ch channel) error {
 		}
 	}
 
-	deliveries, err := ch.Consume(r.queue, r.consumerTag, r.ackMode == AckNone, r.exclusive, false, false, nil)
+	// A consumer tag this receiver chose. Passing an empty one does not leave
+	// the consumer nameless — amqp091-go generates `ctag-<program>-<n>` — but it
+	// does leave *us* without the name: Consume does not return it, and the
+	// only other place it appears is on a delivery, which is no use before the
+	// first one arrives. Draining withdraws the consumer by name, so without
+	// this there is no way to stop consuming short of giving up the channel,
+	// and giving up the channel is what invalidates every outstanding
+	// acknowledgement. It doubles as the identity `rabbitmqctl list_consumers`
+	// shows, which is an improvement on the generated string.
+	//
+	// Unique by construction: the client opens one channel per receiver, and a
+	// tag only has to be unique on its own channel.
+	tag := r.consumerTag
+	if tag == "" {
+		tag = "vinculum-" + r.clientName + "-" + r.queue
+	}
+	// Capped whichever it came from. A configured tag is no less able to
+	// overrun a shortstr than a generated one, and the failure is silent.
+	tag = capConsumerTag(tag)
+
+	deliveries, err := ch.Consume(r.queue, tag, r.ackMode == AckNone, r.exclusive, false, false, nil)
 	if err != nil {
 		return fmt.Errorf("rabbitmq receiver: consume %q: %w", r.queue, err)
 	}
 
-	loopCtx, cancel := context.WithCancel(ctx)
+	workCtx, stopWork := context.WithCancel(ctx)
+	readCtx, stopRead := context.WithCancel(workCtx)
 	done := make(chan struct{})
 
 	r.mu.Lock()
-	r.cancel = cancel
+	r.stopWork = stopWork
+	r.stopRead = stopRead
 	r.loopDone = done
+	r.ch = ch
+	r.activeTag = tag
+	// stillDelivering is deliberately left as it is. The guard above has
+	// already established that it is nil or closed, and a closed channel
+	// answers stillRunning the same way nil does — until this cycle's own Drain
+	// replaces it.
 	r.mu.Unlock()
 
-	go r.runLoop(loopCtx, deliveries, done)
+	go r.runLoop(readCtx, workCtx, deliveries, done)
 	return nil
 }
 
-// Stop signals the delivery loop to exit and waits for it. It does not call
-// basic.cancel or close the channel — that is the client's responsibility, so
-// that channel-level recovery (Stop + Start with a fresh channel) is cheap.
+// capConsumerTag truncates a consumer tag to fit an AMQP shortstr.
 //
-// Safe to call before Start (no-op) or repeatedly.
-func (r *RMQReceiver) Stop() {
+// The cap is not advisory: the wire encoder writes the length as a single byte,
+// so an over-length tag goes out silently truncated modulo 256 — and a tag that
+// arrives shortened is one basic.cancel cannot name, which would leave a drain
+// unable to withdraw the consumer it registered. The prefix is what makes a tag
+// recognisable, so the tail is what gives way, on a rune boundary rather than
+// mid-sequence.
+func capConsumerTag(tag string) string {
+	// The library's own limit, and the only one there is: a shortstr's length
+	// is one byte. Capping shorter would silently rewrite a configured tag that
+	// would have worked.
+	const maxTag = 255
+	if len(tag) <= maxTag {
+		return tag
+	}
+	cut := maxTag
+	for cut > 0 && !utf8.RuneStart(tag[cut]) {
+		cut--
+	}
+	return tag[:cut]
+}
+
+// Drain withdraws the consumer and waits for the loop to finish what the
+// broker had already sent. It leaves everything else alone: the channel stays
+// open, the epoch does not move, and every delivery tag handed out stays good —
+// so a message still travelling through a queue downstream acknowledges
+// normally when the work lands.
+//
+// That last part is what separates this from Stop, and on AMQP it is the whole
+// point: a delivery tag means nothing except on the channel that issued it, so
+// a receiver that closed its channel to stop consuming would invalidate every
+// outstanding acknowledgement in the act of stopping.
+//
+// basic.cancel rather than a cancelled context, because the broker then stops
+// sending and closes the delivery channel *after* what it has already sent, so
+// the prefetched backlog is handled rather than abandoned. With the default
+// prefetch of ten that is up to ten messages that would otherwise be redelivered
+// on the next boot. When the cancel cannot be sent — a channel already dying —
+// the loop is ended the other way rather than waited on forever.
+//
+// Bounded by ctx, which the caller sizes: delivery runs user-supplied work.
+//
+// Safe to call before Start, after Stop, or twice — though a second call after
+// one that timed out reports the timeout again rather than a clean drain, since
+// the delivery it gave up on is still running.
+//
+// Terminal for the receiver: Start refuses afterwards, including on a receiver
+// that had not started when the drain reached it. Draining is a shutdown, not a
+// pause, and the client's reconnect and channel-recovery paths both end in
+// Start — so anything short of a permanent refusal leaves a window in which one
+// of them puts the receiver back to consuming.
+func (r *RMQReceiver) Drain(ctx context.Context) error {
 	r.mu.Lock()
-	cancel := r.cancel
-	done := r.loopDone
-	r.cancel = nil
-	r.loopDone = nil
+	// Recorded first and under the same lock Start takes, so a receiver that
+	// has not started yet is still refused afterwards. Draining one of those is
+	// otherwise a no-op that reports success, and the reconnect that was
+	// half-way through starting it would then carry on.
+	r.drained = true
+
+	stopRead := r.stopRead
+	if stopRead == nil {
+		r.mu.Unlock()
+		if r.stillRunning() {
+			return fmt.Errorf("rabbitmq receiver: still delivering for queue %q", r.queue)
+		}
+		return nil
+	}
+	ch, tag, done := r.ch, r.activeTag, r.loopDone
+	r.stopRead = nil
+
+	// Published under the same lock that cleared stopRead, because the two
+	// together are what a concurrent second Drain reads. Between them it would
+	// see the field already taken and no waiter yet, and report a clean drain
+	// that has not happened.
+	if done != nil {
+		r.stillDelivering.Store(&done)
+	}
 	r.mu.Unlock()
 
-	if cancel == nil {
-		return
+	// Withdrawing the consumer is a synchronous AMQP round trip, and it is off
+	// the lock and behind ctx for the same reason: basic.cancel waits for
+	// basic.cancel-ok with no deadline of its own, so against a connection that
+	// has stopped answering it unblocks only when the heartbeat reader gives up
+	// — three missed intervals, past a ten-second budget at the ten-second
+	// default, and never at all when heartbeats are disabled. Waiting for it
+	// inline would hand a dead broker the power to stop the process exiting,
+	// which is the failure the bound exists to prevent, and holding the mutex
+	// across it would block Stop behind the same wait.
+	var cancelErr error
+	var timedOut bool
+	if ch != nil {
+		sent := make(chan error, 1) // buffered: the goroutine outlives a timeout
+		go func() { sent <- ch.Cancel(tag, false) }()
+		select {
+		case cancelErr = <-sent:
+		case <-ctx.Done():
+			timedOut = true
+		}
 	}
-	cancel()
+	if ch == nil || cancelErr != nil || timedOut {
+		// No consumer to withdraw, or the broker could not be told, or it was
+		// not told in time. Ending the loop directly abandons whatever the
+		// broker already sent — those deliveries are unacknowledged, so they
+		// are redelivered rather than lost, which is the same outcome as the
+		// channel dying underneath us.
+		stopRead()
+	}
+
+	// Reported only when the broker actually refused. A cancel that merely
+	// outlived the budget may yet land, and may yet close the delivery stream
+	// behind the backlog exactly as intended, so claiming a redelivery here
+	// would be asserting an outcome that has not happened. The caller is told
+	// the drain timed out, which is what did happen.
+	if cancelErr != nil {
+		r.logger.Warn("rabbitmq receiver: could not withdraw the consumer; "+
+			"the deliveries the broker has already sent will be redelivered",
+			zap.String("queue", r.queue),
+			zap.String("consumer_tag", tag),
+			zap.Error(cancelErr))
+	}
+
+	// Checked before the wait below rather than raced against it. Once the
+	// deadline has passed, `done` closes almost at once — stopRead just ended
+	// the loop — so both arms of that select are ready and the choice between
+	// them is random. Half the time it would report a clean drain of a receiver
+	// whose consumer may still be registered.
+	if ctx.Err() != nil {
+		return fmt.Errorf("rabbitmq receiver: drain queue %q: %w", r.queue, ctx.Err())
+	}
+
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		// The loop has gone, so cancelling the read context releases its node
+		// rather than abandoning anything. Not done before the wait: it would
+		// race the loop's own exit and cut the backlog short.
+		stopRead()
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("rabbitmq receiver: drain queue %q: %w", r.queue, ctx.Err())
+	}
+}
+
+// Stop signals the delivery loop to exit and waits for it, then retires every
+// delivery tag it handed out. It does not close the channel — that is the
+// client's responsibility, so that channel-level recovery (Stop + Start with a
+// fresh channel) is cheap.
+//
+// It waits for the loop, so a delivery still running finishes and settles
+// normally — with one exception. A Drain that timed out has already given that
+// delivery a bounded chance to finish, and it did not take it; waiting here
+// would hand the same expression a second wait with no bound at all. So Stop
+// cancels and reports rather than blocking, because the one thing a stuck
+// action must never be able to do is stop the process from exiting. Whether it
+// is *still* running is checked here rather than remembered from the drain, a
+// whole phase earlier.
+//
+// Safe to call before Start (no-op) or repeatedly; repeated calls repeat the
+// answer, as Drain's do.
+func (r *RMQReceiver) Stop() error {
+	r.mu.Lock()
+	stopWork := r.stopWork
+	done := r.loopDone
+	r.stopRead, r.stopWork, r.loopDone, r.ch = nil, nil, nil, nil
+	r.mu.Unlock()
+
+	if stopWork == nil {
+		return r.stoppedWithDeliveryRunning()
+	}
+	// Cancelling work cancels reading with it: the read context is derived from
+	// this one, so a Stop that was not preceded by a Drain still ends the loop.
+	stopWork()
+
+	if err := r.stoppedWithDeliveryRunning(); err != nil {
+		// The epoch still moves. The channel is about to go, and a tag that
+		// outlives it acknowledges nothing — or worse, on a reconnected channel,
+		// acknowledges something else.
+		r.epoch.Add(1)
+		return err
+	}
 	if done != nil {
 		<-done
 	}
@@ -181,17 +468,40 @@ func (r *RMQReceiver) Stop() {
 	// message. Only a settle arriving after handling has finished — one held by
 	// an async queue, or by a configuration settling on its own schedule — sees
 	// the new epoch, and for that one the tag really is gone.
+	//
+	// Draining first is what makes that set small: by the time a graceful
+	// shutdown reaches here, the pipeline has emptied and those settles have
+	// already been made.
 	r.epoch.Add(1)
+	return nil
 }
 
-// runLoop reads deliveries until ctx is cancelled or the deliveries channel
-// is closed (the broker cancelled us, the channel closed, or the connection
-// dropped). Each delivery is dispatched via handleDelivery.
-func (r *RMQReceiver) runLoop(ctx context.Context, deliveries <-chan amqp.Delivery, done chan struct{}) {
+func (r *RMQReceiver) stoppedWithDeliveryRunning() error {
+	if !r.stillRunning() {
+		return nil
+	}
+	return fmt.Errorf("rabbitmq receiver: stopped with a delivery still running for queue %q", r.queue)
+}
+
+// runLoop reads deliveries until the read context is cancelled or the
+// deliveries channel is closed (the broker cancelled us, we withdrew the
+// consumer, the channel closed, or the connection dropped). Each delivery is
+// dispatched via handleDelivery.
+//
+// The two contexts are the same lifetime until a drain separates them. readCtx
+// is the fallback way out of this loop; workCtx is what every delivery and
+// every settle runs on, and outlives readCtx by the length of the shutdown.
+// Passing readCtx to a delivery would mean the fallback cancelled the work it
+// was ending, and cancelled the acknowledgement that work was about to produce.
+//
+// A drain does not use readCtx at all in the ordinary case: withdrawing the
+// consumer closes the deliveries channel behind whatever the broker had already
+// sent, so the loop finishes that backlog and leaves through the `!ok` branch.
+func (r *RMQReceiver) runLoop(readCtx, workCtx context.Context, deliveries <-chan amqp.Delivery, done chan struct{}) {
 	defer close(done)
 	for {
 		select {
-		case <-ctx.Done():
+		case <-readCtx.Done():
 			return
 		case d, ok := <-deliveries:
 			if !ok {
@@ -200,7 +510,7 @@ func (r *RMQReceiver) runLoop(ctx context.Context, deliveries <-chan amqp.Delive
 				// recovery; we just exit.
 				return
 			}
-			r.handleDelivery(ctx, d)
+			r.handleDelivery(workCtx, d)
 		}
 	}
 }
@@ -222,7 +532,7 @@ func (r *RMQReceiver) handleDelivery(ctx context.Context, d amqp.Delivery) {
 	// acknowledgement is then one policy over one mechanism rather than a
 	// second route to the broker, and a configuration that settled the message
 	// itself is not settled over the top of.
-	settler := r.newSettler(d)
+	settler, ops := r.newSettler(d)
 
 	vinculumTopic, fields, sub, fallbackAction, err := r.resolveTopicPart1(d.RoutingKey)
 	if err != nil {
@@ -360,6 +670,15 @@ func (r *RMQReceiver) handleDelivery(ctx context.Context, d amqp.Delivery) {
 	// configuration that settled the message itself does not have it settled
 	// twice.
 	bus.SettleOnReturn(ctx, r.subscriber, err)
+
+	// An observing subscriber settles nothing and defers to nobody — it saw the
+	// delivery go past. SettleOnReturn returns without acting, so no settle is
+	// coming from anywhere and this delivery has to be released by hand or the
+	// count never comes back down. It is the only path through here that
+	// reaches no settler at all: every failure above nacks, and a nack releases.
+	if ops != nil && bus.DispositionOf(r.subscriber) == bus.Observed {
+		ops.release()
+	}
 
 	if err != nil {
 		r.logger.Error("rabbitmq receiver: subscriber.OnEvent",

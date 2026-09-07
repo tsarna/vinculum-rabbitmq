@@ -33,6 +33,12 @@ type Client struct {
 	mu       sync.Mutex
 	started  bool
 	stopping bool
+	// drained says the client has been asked to stop consuming. It outlives
+	// Drain because the reconnect and channel-recovery paths do not: they stay
+	// live until Stop cancels the life context, and both of them end in
+	// receiver.Start, which would register the consumer again. A shutdown would
+	// then be consuming during the phase that waits for it to be finished.
+	drained bool
 
 	// connected tracks whether OnConnect has fired without a subsequent
 	// OnDisconnect. Used to guarantee OnDisconnect fires exactly once per
@@ -178,6 +184,12 @@ func (c *Client) connectAndWatch(ctx context.Context) {
 // it to exit before returning.
 func (c *Client) Stop() error {
 	c.mu.Lock()
+	// Set before the early return, not after it. Stopping is a stronger
+	// statement than draining, so it should never leave a client answering
+	// "not drained" — and one of the paths through that return is a Stop
+	// racing a Start, where a connect already under way is exactly the thing
+	// that would otherwise go on to register a consumer.
+	c.drained = true
 	if c.stopping || !c.started {
 		c.stopping = true
 		c.mu.Unlock()
@@ -199,9 +211,12 @@ func (c *Client) Stop() error {
 	}
 
 	// Stop receivers (resets their internal cancel/loopDone state so the
-	// instances can be reused if necessary).
+	// instances can be reused if necessary). A receiver that gave up on a
+	// delivery during an earlier drain says so here rather than blocking on it,
+	// and the answer travels back with whatever closing the connection reports.
+	var stopErrs []error
 	for _, r := range c.receivers {
-		r.Stop()
+		stopErrs = append(stopErrs, r.Stop())
 	}
 
 	// Fire OnDisconnect exactly once if the reconnect goroutine hadn't
@@ -238,9 +253,61 @@ func (c *Client) Stop() error {
 		_ = ch.Close()
 	}
 	if conn != nil {
-		return conn.Close()
+		stopErrs = append(stopErrs, conn.Close())
 	}
-	return nil
+	return errors.Join(stopErrs...)
+}
+
+// Drain withdraws every receiver's consumer and waits for the deliveries the
+// broker has already sent to be handled. It is the first phase of a graceful
+// shutdown: afterwards the client takes on no new work, and everything else
+// still works — the connection is up, the channels are open, and every delivery
+// tag handed out is still good, so acknowledgements for work still in flight
+// arrive normally. Stop is what ends that.
+//
+// Every receiver drains at once, under the one deadline. They are independent,
+// and what is being waited for is delivery — one receiver's slow action is no
+// reason to cut another's short.
+//
+// Safe to call on a client that was never started, or twice.
+func (c *Client) Drain(ctx context.Context) error {
+	c.mu.Lock()
+	receivers := c.receivers
+	c.drained = true
+	c.mu.Unlock()
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(receivers))
+	for i, r := range receivers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = r.Drain(ctx)
+		}()
+	}
+	wg.Wait()
+
+	return errors.Join(errs...)
+}
+
+// errDrained reports a channel recovery declined because the client has stopped
+// consuming. It is not a failure — there is nothing to recover to, and no
+// reconnect will follow — so the caller says so in its own words rather than
+// reporting a broken connection during an orderly shutdown.
+var errDrained = errors.New("client drained; not recovering the receiver channel")
+
+// isDrained reports whether the client has been asked to stop consuming, so the
+// connect and recovery paths can skip the work of starting a receiver that
+// would refuse anyway.
+//
+// It is an optimisation, not the guarantee. Reading it and then calling
+// receiver.Start are two steps, and a drain can land between them; what makes
+// that safe is the receiver refusing under its own lock. This only keeps a
+// shutdown from opening channels and declaring topology it has no use for.
+func (c *Client) isDrained() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.drained
 }
 
 // setupChannels opens one channel per sender and one per receiver on conn,
@@ -253,7 +320,10 @@ func (c *Client) setupChannels(ctx context.Context, conn *amqp.Connection) error
 
 	cleanup := func() {
 		for _, r := range c.receivers {
-			r.Stop()
+			// Discarded here and at every other recovery site: Stop reports a
+			// delivery a drain gave up on, and no drain has run on these paths
+			// — the channel died, which is a different story with its own log.
+			_ = r.Stop()
 		}
 		for _, s := range c.senders {
 			s.SetChannel(nil)
@@ -287,7 +357,17 @@ func (c *Client) setupChannels(ctx context.Context, conn *amqp.Connection) error
 			cleanup()
 			return fmt.Errorf("rabbitmq client %q: %w", c.cfg.ClientName, topoErr)
 		}
-		if startErr := r.Start(ctx, ch); startErr != nil {
+		// Not started once the client has been drained. This runs on every
+		// connect, including one that completes *during* a shutdown — a broker
+		// that was down at boot and came back, or a reconnect that landed
+		// between the drain and the stop. Registering the consumer again there
+		// would put the process back to consuming during the phase that waits
+		// for it to have finished.
+		if c.isDrained() {
+			c.cfg.Logger.Info("rabbitmq client: connected while draining; not consuming",
+				zap.String("client", c.cfg.ClientName),
+				zap.String("queue", r.Queue()))
+		} else if startErr := r.Start(ctx, ch); startErr != nil {
 			_ = ch.Close()
 			cleanup()
 			return fmt.Errorf("rabbitmq client %q: start receiver %q: %w", c.cfg.ClientName, r.Queue(), startErr)
@@ -358,7 +438,7 @@ func (c *Client) handleDisconnect(ctx context.Context) {
 	c.mu.Unlock()
 
 	for _, r := range c.receivers {
-		r.Stop()
+		_ = r.Stop()
 	}
 	for _, s := range c.senders {
 		s.SetChannel(nil)
@@ -587,6 +667,15 @@ func (c *Client) watchReceiverChannel(ctx context.Context, idx int, ch *amqp.Cha
 				zap.String("reason", amqpErr.Reason))
 
 			newCh, err := c.recoverReceiverChannel(ctx, idx)
+			if errors.Is(err, errDrained) {
+				// Declined, not failed, and there will be no reconnect either:
+				// the process is shutting down and this receiver has stopped
+				// consuming on purpose.
+				c.cfg.Logger.Info("rabbitmq client: receiver channel closed after the drain; not recovering it",
+					zap.String("client", c.cfg.ClientName),
+					zap.Int("receiver_index", idx))
+				return
+			}
 			if err != nil {
 				c.cfg.Logger.Warn("rabbitmq client: receiver channel recovery failed; deferring to reconnect",
 					zap.String("client", c.cfg.ClientName),
@@ -650,6 +739,7 @@ func (c *Client) recoverReceiverChannel(ctx context.Context, idx int) (*amqp.Cha
 	c.mu.Lock()
 	conn := c.conn
 	connected := c.connected
+	drained := c.drained
 	c.mu.Unlock()
 
 	if !connected || conn == nil {
@@ -660,11 +750,27 @@ func (c *Client) recoverReceiverChannel(ctx context.Context, idx int) (*amqp.Cha
 	}
 	r := c.receivers[idx]
 
+	// Before the round trips, not after them. Recovering a channel for a
+	// receiver that is never going to consume again costs a channel open and a
+	// topology declare, both against a broker the process is disconnecting
+	// from — and the receiver's own refusal, arriving later, reads in the log
+	// as a recovery that failed rather than one that was declined.
+	//
+	// Stopped on the way out even so, because that is what retires the delivery
+	// tags this channel issued. Skipping it would leave them reading valid
+	// until the client stops, so a settle in that window would reach a dead
+	// channel and come back with a transport error instead of the reason that
+	// says what became of the message.
+	if drained {
+		_ = r.Stop()
+		return nil, errDrained
+	}
+
 	// Reset the receiver so r.Start does not error out as "already started".
 	// The delivery loop has already exited (the deliveries channel was
 	// closed when the underlying AMQP channel closed); r.Stop just clears
 	// the bookkeeping.
-	r.Stop()
+	_ = r.Stop()
 
 	ch, err := conn.Channel()
 	if err != nil {
@@ -674,6 +780,12 @@ func (c *Client) recoverReceiverChannel(ctx context.Context, idx int) (*amqp.Cha
 		_ = ch.Close()
 		return nil, fmt.Errorf("redeclare topology: %w", topoErr)
 	}
+	// Checked again, because the drain may have landed since. The receiver
+	// refuses either way; this only avoids leaving a channel open for it.
+	if c.isDrained() {
+		_ = ch.Close()
+		return nil, errDrained
+	}
 	if startErr := r.Start(ctx, ch); startErr != nil {
 		_ = ch.Close()
 		return nil, fmt.Errorf("restart receiver: %w", startErr)
@@ -682,7 +794,7 @@ func (c *Client) recoverReceiverChannel(ctx context.Context, idx int) (*amqp.Cha
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn != conn || !c.connected {
-		r.Stop()
+		_ = r.Stop()
 		_ = ch.Close()
 		return nil, errors.New("connection changed during recovery")
 	}

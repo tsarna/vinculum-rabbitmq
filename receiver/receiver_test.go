@@ -43,11 +43,18 @@ type fakeAcknowledger struct {
 	rejects  int
 	requeue  bool
 	multiple bool
+	// ackErr, when set, fails the acknowledgement without counting it — which
+	// is what a channel that has gone does, and the case the settler responds
+	// to by releasing its claim so another attempt can be made.
+	ackErr error
 }
 
 func (a *fakeAcknowledger) Ack(_ uint64, multiple bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.ackErr != nil {
+		return a.ackErr
+	}
 	a.acks++
 	a.multiple = multiple
 	return nil
@@ -449,7 +456,7 @@ func TestRunLoop_ExitsOnContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 
-	go r.runLoop(ctx, deliveries, done)
+	go r.runLoop(ctx, ctx, deliveries, done)
 	cancel()
 	<-done // must return promptly
 }
@@ -467,7 +474,7 @@ func TestRunLoop_ProcessesUntilChannelClosed(t *testing.T) {
 	deliveries <- amqp.Delivery{Acknowledger: a, RoutingKey: "c.d", Body: []byte("2"), DeliveryTag: 2}
 	close(deliveries)
 
-	go r.runLoop(context.Background(), deliveries, done)
+	go r.runLoop(context.Background(), context.Background(), deliveries, done)
 	<-done
 
 	assert.Equal(t, 2, sub.calls)

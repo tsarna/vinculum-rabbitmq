@@ -120,8 +120,16 @@ func (b *ReceiverBuilder) WithDecodeErrorHook(h wire.DecodeErrorHook) *ReceiverB
 	return b
 }
 
-// WithConsumerTag sets the AMQP consumer tag. Empty (default) means the
-// broker assigns one.
+// WithConsumerTag sets the AMQP consumer tag.
+//
+// Empty (the default) means the receiver names itself
+// `vinculum-<client>-<queue>`, which is what appears in `rabbitmqctl
+// list_consumers`. It does not mean the consumer is nameless: passing an empty
+// tag to Consume has the library generate one, but it is not returned to the
+// caller — and a drain has to name the consumer to withdraw it.
+//
+// Either way the tag is truncated to fit an AMQP shortstr, since an over-length
+// one is silently shortened on the wire and would then be unwithdrawable.
 func (b *ReceiverBuilder) WithConsumerTag(tag string) *ReceiverBuilder {
 	b.consumerTag = tag
 	return b

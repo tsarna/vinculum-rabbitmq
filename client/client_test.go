@@ -9,6 +9,8 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bus "github.com/tsarna/vinculum-bus"
+	"github.com/tsarna/vinculum-rabbitmq/receiver"
 )
 
 func TestDefaultReconnectBackoff_ExponentialWithCap(t *testing.T) {
@@ -421,6 +423,58 @@ func TestRecoverReceiverChannel_FailsWhenNotConnected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "connection is not currently established")
 }
+
+// A channel recovery that lands after the drain must not put the receiver back
+// to consuming. The receiver refuses on its own account, under its own lock,
+// which is what makes that a guarantee; this is the client declining before it
+// spends two round trips on a channel nothing will use — and reporting it as a
+// decision rather than as a failure, since there is no reconnect coming.
+func TestRecoverReceiverChannel_DeclinesAfterADrain(t *testing.T) {
+	c := NewClient(Config{ClientName: "x"})
+	c.receivers = []*receiver.RMQReceiver{mustReceiver(t)}
+
+	// Connected, so the check under test is the one that answers.
+	c.mu.Lock()
+	c.connected = true
+	c.conn = &amqp.Connection{}
+	c.mu.Unlock()
+
+	require.NoError(t, c.Drain(context.Background()),
+		"draining a client whose receivers never started is a clean no-op")
+
+	_, err := c.recoverReceiverChannel(context.Background(), 0)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errDrained,
+		"a decline must be distinguishable from a recovery that failed")
+}
+
+// The other direction — that a client which was never drained still recovers —
+// is not tested here and cannot cheaply be: everything past the check calls
+// conn.Channel(), and the package has no connection fake. What stands in for it
+// is that a client is only drained by Drain or Stop, asserted below, and that
+// nothing else in this file drains.
+
+// Stop implies the drain, so a recovery racing a plain Stop is declined too
+// rather than reopening a channel the teardown is about to close.
+func TestStopMarksTheClientDrained(t *testing.T) {
+	c := NewClient(Config{ClientName: "x"})
+	require.NoError(t, c.Stop())
+	assert.True(t, c.isDrained())
+}
+
+func mustReceiver(t *testing.T) *receiver.RMQReceiver {
+	t.Helper()
+	r, err := receiver.NewReceiver().
+		WithQueue("q").
+		WithSubscriber(&noopSubscriber{}).
+		Build()
+	require.NoError(t, err)
+	return r
+}
+
+type noopSubscriber struct{ bus.BaseSubscriber }
+
+func (noopSubscriber) OnEvent(context.Context, string, any, map[string]string) error { return nil }
 
 // ─── on_connect / on_disconnect lifecycle ───────────────────────────────────
 

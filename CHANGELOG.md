@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Client.Drain` and `RMQReceiver.Drain`, so consuming can stop without the
+  connection closing.** Stopping used to be one action: cancel everything and
+  close. That is the wrong shape for a graceful shutdown, where a process wants
+  to stop *accepting* deliveries long before it stops being able to
+  acknowledge them — because the acknowledgement travels over the channel the
+  stop closes.
+
+  The receiver drains with `basic.cancel` rather than by cancelling a context,
+  which is the distinction that matters on this transport: the broker stops
+  sending, and the deliveries already prefetched into the local buffer are
+  *handled* rather than abandoned. Cancelling the context would have thrown
+  away work the process had already been given, and RabbitMQ would have
+  redelivered every message of it. `Client.Drain` fans out to every receiver
+  and leaves senders, channels and the connection untouched.
+
+  Draining is terminal. The reconnect and channel-recovery paths outlive it and
+  both end in `receiver.Start`, which would otherwise register the consumer
+  again — so a drained client refuses to start one, and a shutdown does not
+  find itself consuming during the phase that waits for consuming to be over.
+
+- **`RMQReceiver.Unsettled`, the count of deliveries nothing has settled yet.**
+  Not the broker's unacked count: a delivery left unacked by a nack is
+  RabbitMQ's business. This is the narrower number a shutdown can usefully wait
+  for — acknowledgements that are still coming.
+
+- **A named consumer tag.** Each receiver now registers as
+  `vinculum-<client>-<queue>` instead of taking a server-generated tag, so
+  `rabbitmqctl list_consumers` names the config that owns each one. Long tags
+  are capped to stay within the protocol's limit.
+
+### Changed
+
+- **`RMQReceiver.Stop` returns an `error`** (it was `func()`). It reports a
+  delivery a previous drain gave up on, which is also the case where it now
+  declines to wait: the drain has already given that delivery a bounded chance
+  to finish, and waiting again with no bound would let one stuck action stop
+  the process from exiting. `Client.Stop` collects those alongside whatever
+  closing the connection reports.
+
+  A delivery's *acknowledgement* is unaffected. `Stop` retires the channel's
+  delivery tags and `Drain` deliberately does not, so a settle that arrives
+  during a drain still refers to something the broker recognises.
+
 ## [0.8.0] - 2026-09-01
 
 ### Changed

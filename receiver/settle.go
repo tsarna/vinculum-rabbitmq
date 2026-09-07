@@ -2,6 +2,7 @@ package receiver
 
 import (
 	"context"
+	"sync/atomic"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	bus "github.com/tsarna/vinculum-bus"
@@ -45,11 +46,30 @@ type deliverySettleOps struct {
 	// epoch is the receiver's channel generation at the time of delivery. See
 	// Valid.
 	epoch uint64
+
+	// released guards the receiver's unsettled count against being decremented
+	// twice for one delivery. The settler above deduplicates settles, but it
+	// releases its claim when an op returns an error, so a failed ack can be
+	// retried and reach Ack a second time.
+	released atomic.Bool
+}
+
+// release drops this delivery from the receiver's unsettled count, once.
+//
+// It runs even when the op that called it failed. A delivery whose ack did not
+// reach the broker is genuinely still unsettled, but the count exists to tell a
+// shutdown when to stop waiting, and waiting longer for a channel that is
+// refusing acknowledgements does not produce one.
+func (o *deliverySettleOps) release() {
+	if o.released.CompareAndSwap(false, true) {
+		o.r.unsettled.Add(-1)
+	}
 }
 
 // Ack acknowledges the delivery, which is what removes it from the broker's
 // unacknowledged set and frees the prefetch slot it occupies.
 func (o *deliverySettleOps) Ack(_ context.Context) error {
+	defer o.release()
 	return o.d.Ack(false)
 }
 
@@ -65,6 +85,7 @@ func (o *deliverySettleOps) Ack(_ context.Context) error {
 // the dead-letter exchange as itself, with the broker's own x-death header
 // saying it was rejected.
 func (o *deliverySettleOps) Nack(ctx context.Context, reason string) error {
+	defer o.release()
 	if err := o.d.Nack(false, false); err != nil {
 		return err
 	}
@@ -102,8 +123,21 @@ func (o *deliverySettleOps) Keepalive(_ context.Context) (bool, error) {
 // reconnected" says the message will be redelivered, where a raw
 // channel/connection-is-not-open error from deep in the AMQP library says
 // nothing about what became of the message.
+// Saying no is also where the delivery stops being this receiver's to settle,
+// so it is where the unsettled count lets go of it. The settler asks this
+// before every settle and every keepalive and abandons the delivery when the
+// answer is no — never reaching Ack or Nack, and so never reaching the release
+// those two carry. Without this, the count keeps a delivery whose channel has
+// gone, and keeps it forever: every later shutdown would then spend its whole
+// budget waiting for an acknowledgement that cannot be sent, and warn about a
+// message nobody is carrying.
+//
+// The epoch only ever moves forward, so a delivery that has been left behind
+// once is never valid again — which is what makes releasing here final rather
+// than premature.
 func (o *deliverySettleOps) Valid() (bool, string) {
 	if o.epoch != o.r.epoch.Load() {
+		o.release()
 		return false, "channel reconnected"
 	}
 	return true, ""
@@ -121,15 +155,22 @@ func (o *deliverySettleOps) Valid() (bool, string) {
 // returns as soon as the message is enqueued. Now it means "whoever finishes
 // the work settles this", and the acknowledgement follows the work however many
 // hops away it happens.
-func (r *RMQReceiver) newSettler(d amqp.Delivery) bus.Settler {
+// Handing one out is what makes the delivery unsettled, so the count is
+// incremented here rather than at the delivery's other end. Teardown waits on
+// that count: a delivery a `queue_size` queue is still carrying is acknowledged
+// long after the loop that received it has stopped, and the ack has to find the
+// channel open when it does. Under AckNone there is no settler and nothing to
+// count — the broker considered the message delivered when it sent it.
+func (r *RMQReceiver) newSettler(d amqp.Delivery) (bus.Settler, *deliverySettleOps) {
 	if r.ackMode == AckNone {
-		return nil
+		return nil, nil
 	}
 	ops := &deliverySettleOps{r: r, d: d, epoch: r.epoch.Load()}
+	r.unsettled.Add(1)
 	if r.ackMode == AckAfterHandling {
-		return bus.NewSettler(ops, bus.AutoSettle())
+		return bus.NewSettler(ops, bus.AutoSettle()), ops
 	}
-	return bus.NewSettler(ops)
+	return bus.NewSettler(ops), ops
 }
 
 // ack settles a delivery this receiver is answering for itself. A nil settler
