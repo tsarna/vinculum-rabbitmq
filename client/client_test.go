@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -11,6 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 	bus "github.com/tsarna/vinculum-bus"
 	"github.com/tsarna/vinculum-rabbitmq/receiver"
+	"github.com/tsarna/vinculum-rabbitmq/sender"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestDefaultReconnectBackoff_ExponentialWithCap(t *testing.T) {
@@ -380,32 +384,72 @@ func TestRedactURL(t *testing.T) {
 func TestIsConnectionLevel(t *testing.T) {
 	tests := []struct {
 		name string
-		err  *amqp.Error
+		code int
 		want bool
 	}{
-		{"nil error means conn-level (library quirk)", nil, true},
-		{"404 NOT_FOUND is channel-level", &amqp.Error{Code: 404}, false},
-		{"405 RESOURCE_LOCKED is channel-level", &amqp.Error{Code: 405}, false},
-		{"406 PRECONDITION_FAILED is channel-level", &amqp.Error{Code: 406}, false},
-		{"403 ACCESS_REFUSED is channel-level", &amqp.Error{Code: 403}, false},
-		{"500 is connection-level", &amqp.Error{Code: 500}, true},
-		{"501 FRAME_ERROR is connection-level", &amqp.Error{Code: 501}, true},
-		{"504 CHANNEL_ERROR is connection-level (per AMQP)", &amqp.Error{Code: 504}, true},
-		{"540 NOT_IMPLEMENTED is connection-level", &amqp.Error{Code: 540}, true},
-		{"541 INTERNAL_ERROR is connection-level", &amqp.Error{Code: 541}, true},
-		{"200 (success / normal close) is not conn-level", &amqp.Error{Code: 200}, false},
-		// 320 (CONNECTION_FORCED) is semantically connection-level but lives
-		// in the 3xx soft-error range. The classifier currently treats it
-		// as channel-level; recovery will fail fast (conn is dead) and the
-		// connection-level reconnect loop will take over. Documenting via
-		// test so a future tightening of the classifier is intentional.
-		{"320 CONNECTION_FORCED currently routes to channel recovery", &amqp.Error{Code: 320}, false},
+		{"311 CONTENT_TOO_LARGE is channel-level", 311, false},
+		{"312 NO_ROUTE is channel-level", 312, false},
+		{"313 NO_CONSUMERS is channel-level", 313, false},
+		{"403 ACCESS_REFUSED is channel-level", 403, false},
+		{"404 NOT_FOUND is channel-level", 404, false},
+		{"405 RESOURCE_LOCKED is channel-level", 405, false},
+		{"406 PRECONDITION_FAILED is channel-level", 406, false},
+		// Hard exceptions below 500. A forced close is the one a broker sends
+		// when an operator closes the connection.
+		{"320 CONNECTION_FORCED is connection-level", 320, true},
+		{"402 INVALID_PATH is connection-level", 402, true},
+		{"500 is connection-level", 500, true},
+		{"501 FRAME_ERROR is connection-level", 501, true},
+		{"504 CHANNEL_ERROR is connection-level (per AMQP)", 504, true},
+		{"540 NOT_IMPLEMENTED is connection-level", 540, true},
+		{"541 INTERNAL_ERROR is connection-level", 541, true},
+		// Not an exception at all, so not a soft one either: a channel closed
+		// with it is left to the reconnect loop rather than reopened. Brokers
+		// close a channel on an error, so this is not expected on the wire.
+		{"200 REPLY_SUCCESS is connection-level", 200, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, isConnectionLevel(tt.err))
+			assert.Equal(t, tt.want, isConnectionLevel(serverError(t, tt.code)))
 		})
 	}
+
+	t.Run("nil is conn-level", func(t *testing.T) {
+		assert.True(t, isConnectionLevel(nil))
+	})
+}
+
+// serverError builds the *amqp.Error the library delivers for a close the broker
+// sent with code. The library's constructor is unexported, so this goes through
+// the same public path it does: the error comes back from a failed dial against
+// a fake broker that answers connection.start with connection.close.
+//
+// Building the struct literal here instead would set Recover by hand, and the
+// test would then check this file's idea of which codes are soft rather than
+// the library's.
+func serverError(t *testing.T, code int) *amqp.Error {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Discard the protocol header, then close the connection with code.
+		_, _ = io.ReadFull(conn, make([]byte, 8))
+		_, _ = conn.Write(frame(0, connectionClose(uint16(code), "test")))
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	_, err = amqp.DialConfig("amqp://"+ln.Addr().String()+"/", amqp.Config{Dial: amqp.DefaultDial(2 * time.Second)})
+	var amqpErr *amqp.Error
+	require.ErrorAs(t, err, &amqpErr)
+	require.Equal(t, code, amqpErr.Code)
+	return amqpErr
 }
 
 func TestRecoverSenderChannel_FailsWhenNotConnected(t *testing.T) {
@@ -460,6 +504,41 @@ func TestStopMarksTheClientDrained(t *testing.T) {
 	c := NewClient(Config{ClientName: "x"})
 	require.NoError(t, c.Stop())
 	assert.True(t, c.isDrained())
+}
+
+// A broker closes a connection an operator forced shut with 320, below the 500s,
+// and every channel on it reports that close to its watcher. The watchers must
+// leave it to the reconnect loop: a channel recovery on the dead connection
+// cannot succeed, logs its failure, and can outlive Stop to do so.
+func TestForcedConnectionCloseIsLeftToTheReconnectLoop(t *testing.T) {
+	broker := newFakeBroker(t)
+	core, logs := observer.New(zap.InfoLevel)
+
+	s, err := sender.NewSender().WithClientName("x").Build()
+	require.NoError(t, err)
+	c := NewClient(Config{
+		ClientName: "x",
+		Brokers:    []string{broker.url()},
+		Logger:     zap.New(core),
+		// The fake broker takes one connection, so a redial only has its
+		// handshake timeout to end it.
+		ConnectionTimeout: 100 * time.Millisecond,
+		ReconnectBackoff:  func(int) time.Duration { return 10 * time.Millisecond },
+	})
+	c.AddSender(s)
+	require.NoError(t, c.Start(context.Background()))
+	t.Cleanup(func() { _ = c.Stop() })
+	require.Eventually(t, c.IsConnected, 2*time.Second, 5*time.Millisecond)
+
+	broker.closeConnection(amqp.ConnectionForced)
+	require.Eventually(t, func() bool {
+		return logs.FilterMessageSnippet("rabbitmq client: sender channel closed").Len() > 0
+	}, 2*time.Second, 5*time.Millisecond, "the sender's watcher never saw the close")
+
+	assert.Equal(t, 1, logs.FilterMessage(
+		"rabbitmq client: sender channel closed (connection-level); deferring to reconnect").Len())
+	assert.Zero(t, logs.FilterMessage("rabbitmq client: sender channel closed; attempting recovery").Len(),
+		"a forced connection close was treated as a channel error")
 }
 
 func mustReceiver(t *testing.T) *receiver.RMQReceiver {

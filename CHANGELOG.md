@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A forced connection close goes straight to the reconnect loop.** A channel's
+  close was treated as connection-level only for codes of 500 and up, but AMQP
+  0-9-1's hard exceptions include some below that, among them
+  `320 CONNECTION_FORCED` — what a broker sends when an operator closes the
+  connection or the broker shuts down. A forced close sent every channel watcher
+  into a recovery on a connection that was already gone, and a warning for each
+  when it failed — a warning that could land after `Client.Stop` had returned,
+  since the watchers are not joined. A watcher that lost the race with the
+  reconnect loop could instead open a second channel on the new connection and
+  replace the one the reconnect had just installed.
+
+  The classification now uses the library's own `Error.Recover`, which is set
+  only for the soft, channel-level codes. A channel closed with any other code,
+  `200` included, is no longer reopened by its watcher. Brokers report hard
+  exceptions by closing the connection, which the reconnect loop repairs.
+
 ## [0.9.0] - 2026-09-06
 
 ### Added
