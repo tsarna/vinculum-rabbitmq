@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -11,6 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 	bus "github.com/tsarna/vinculum-bus"
 	"github.com/tsarna/vinculum-rabbitmq/receiver"
+	"github.com/tsarna/vinculum-rabbitmq/sender"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestDefaultReconnectBackoff_ExponentialWithCap(t *testing.T) {
@@ -380,32 +384,78 @@ func TestRedactURL(t *testing.T) {
 func TestIsConnectionLevel(t *testing.T) {
 	tests := []struct {
 		name string
-		err  *amqp.Error
+		code int
 		want bool
 	}{
-		{"nil error means conn-level (library quirk)", nil, true},
-		{"404 NOT_FOUND is channel-level", &amqp.Error{Code: 404}, false},
-		{"405 RESOURCE_LOCKED is channel-level", &amqp.Error{Code: 405}, false},
-		{"406 PRECONDITION_FAILED is channel-level", &amqp.Error{Code: 406}, false},
-		{"403 ACCESS_REFUSED is channel-level", &amqp.Error{Code: 403}, false},
-		{"500 is connection-level", &amqp.Error{Code: 500}, true},
-		{"501 FRAME_ERROR is connection-level", &amqp.Error{Code: 501}, true},
-		{"504 CHANNEL_ERROR is connection-level (per AMQP)", &amqp.Error{Code: 504}, true},
-		{"540 NOT_IMPLEMENTED is connection-level", &amqp.Error{Code: 540}, true},
-		{"541 INTERNAL_ERROR is connection-level", &amqp.Error{Code: 541}, true},
-		{"200 (success / normal close) is not conn-level", &amqp.Error{Code: 200}, false},
-		// 320 (CONNECTION_FORCED) is semantically connection-level but lives
-		// in the 3xx soft-error range. The classifier currently treats it
-		// as channel-level; recovery will fail fast (conn is dead) and the
-		// connection-level reconnect loop will take over. Documenting via
-		// test so a future tightening of the classifier is intentional.
-		{"320 CONNECTION_FORCED currently routes to channel recovery", &amqp.Error{Code: 320}, false},
+		{"311 CONTENT_TOO_LARGE is channel-level", 311, false},
+		{"312 NO_ROUTE is channel-level", 312, false},
+		{"313 NO_CONSUMERS is channel-level", 313, false},
+		{"403 ACCESS_REFUSED is channel-level", 403, false},
+		{"404 NOT_FOUND is channel-level", 404, false},
+		{"405 RESOURCE_LOCKED is channel-level", 405, false},
+		{"406 PRECONDITION_FAILED is channel-level", 406, false},
+		// Hard exceptions below 500. A forced close is the one a broker sends
+		// when an operator closes the connection.
+		{"320 CONNECTION_FORCED is connection-level", 320, true},
+		{"402 INVALID_PATH is connection-level", 402, true},
+		{"500 is connection-level", 500, true},
+		{"501 FRAME_ERROR is connection-level", 501, true},
+		{"504 CHANNEL_ERROR is connection-level (per AMQP)", 504, true},
+		{"540 NOT_IMPLEMENTED is connection-level", 540, true},
+		{"541 INTERNAL_ERROR is connection-level", 541, true},
+		// Not an exception at all, so not a soft one either: a channel closed
+		// with it is left to the reconnect loop rather than reopened. Brokers
+		// close a channel on an error, so this is not expected on the wire.
+		{"200 REPLY_SUCCESS is connection-level", 200, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, isConnectionLevel(tt.err))
+			assert.Equal(t, tt.want, isConnectionLevel(serverError(t, tt.code)))
 		})
 	}
+
+	t.Run("nil error means conn-level (library quirk)", func(t *testing.T) {
+		assert.True(t, isConnectionLevel(nil))
+	})
+}
+
+// serverError builds the *amqp.Error the library delivers for a close the broker
+// sent with code. The library's constructor is unexported, so this goes through
+// the same public path it does: the error comes back from a failed dial against
+// a fake broker that answers connection.start with connection.close.
+//
+// Building the struct literal here instead would set Recover by hand, and the
+// test would then check this file's idea of which codes are soft rather than
+// the library's.
+func serverError(t *testing.T, code int) *amqp.Error {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Discard the protocol header, then close the connection with code.
+		_, _ = io.ReadFull(conn, make([]byte, 8))
+		_, _ = conn.Write(connectionCloseFrame(uint16(code), "test"))
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	_, err = amqp.DialConfig("amqp://"+ln.Addr().String()+"/", amqp.Config{Dial: amqp.DefaultDial(2 * time.Second)})
+	var amqpErr *amqp.Error
+	require.ErrorAs(t, err, &amqpErr)
+	require.Equal(t, code, amqpErr.Code)
+	return amqpErr
+}
+
+// connectionCloseFrame encodes an AMQP 0-9-1 connection.close method frame on
+// channel 0 with no failing class or method.
+func connectionCloseFrame(code uint16, reason string) []byte {
+	return frame(1, 0, method(10, 50, u16(code), shortstr(reason), u16(0), u16(0)))
 }
 
 func TestRecoverSenderChannel_FailsWhenNotConnected(t *testing.T) {
@@ -460,6 +510,136 @@ func TestStopMarksTheClientDrained(t *testing.T) {
 	c := NewClient(Config{ClientName: "x"})
 	require.NoError(t, c.Stop())
 	assert.True(t, c.isDrained())
+}
+
+// A watcher can be partway through a channel recovery when Stop cancels the
+// life context, and it logs the outcome when that returns. Stop has to wait for
+// it, or the log line lands after Stop — into a test's logger after the test
+// has ended, which the race detector reports.
+//
+// Driven through the real path: the broker closes a sender's channel with a
+// soft error, the watcher starts recovering it, and the broker holds the reply
+// to the new channel's open while Stop runs.
+func TestStop_WaitsForChannelWatchers(t *testing.T) {
+	broker := newFakeBroker(t)
+	core, logs := observer.New(zap.InfoLevel)
+
+	s, err := sender.NewSender().WithClientName("x").Build()
+	require.NoError(t, err)
+	c := NewClient(Config{ClientName: "x", Brokers: []string{broker.url()}, Logger: zap.New(core)})
+	c.AddSender(s)
+	require.NoError(t, c.Start(context.Background()))
+	require.Eventually(t, c.IsConnected, 2*time.Second, 5*time.Millisecond)
+
+	broker.mu.Lock()
+	broker.holdOpens = true
+	broker.mu.Unlock()
+	broker.closeChannel(1, amqp.PreconditionFailed)
+	select {
+	case <-broker.opened:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the watcher never tried to reopen the channel")
+	}
+
+	time.AfterFunc(200*time.Millisecond, func() { close(broker.release) })
+	require.NoError(t, c.Stop())
+
+	outcome := logs.FilterMessageSnippet("rabbitmq client: sender channel recover").Len()
+	assert.Equal(t, 1, outcome, "Stop returned before the recovering watcher had logged its outcome")
+}
+
+// A stuck action must not be able to hang shutdown through either goroutine
+// Stop joins. Both the channel watcher's recovery and the reconnect loop stop
+// the receiver on their own goroutine, and that Stop waits on the delivery. A
+// delivery that never returns is exactly what makes a broker close the channel
+// (consumer_timeout, 406), and a forced close (320) can land at any time. A
+// shutdown's Drain has to notice the delivery and time out on it rather than
+// report a clean drain, and Stop has to return once it has.
+func TestStop_DoesNotHangBehindARecoveryWaitingOnAStuckDelivery(t *testing.T) {
+	tests := []struct {
+		name  string
+		close func(*fakeBroker)
+		log   string
+	}{
+		{
+			name:  "channel recovery",
+			close: func(b *fakeBroker) { b.closeChannel(1, amqp.PreconditionFailed) },
+			log:   "rabbitmq client: receiver channel closed; attempting recovery",
+		},
+		{
+			name:  "reconnect",
+			close: func(b *fakeBroker) { b.closeConnection(amqp.ConnectionForced) },
+			log:   "rabbitmq client: connection closed; reconnecting",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			broker := newFakeBroker(t)
+			core, logs := observer.New(zap.InfoLevel)
+
+			stuck := &stuckSubscriber{entered: make(chan struct{}, 1), release: make(chan struct{})}
+			t.Cleanup(func() { close(stuck.release) })
+			r, err := receiver.NewReceiver().WithClientName("x").WithQueue("q").WithSubscriber(stuck).Build()
+			require.NoError(t, err)
+			c := NewClient(Config{
+				ClientName: "x",
+				Brokers:    []string{broker.url()},
+				Logger:     zap.New(core),
+				// The fake broker takes one connection, so a redial only has
+				// its handshake timeout to end it.
+				ConnectionTimeout: 100 * time.Millisecond,
+				ReconnectBackoff:  func(int) time.Duration { return 10 * time.Millisecond },
+			})
+			c.AddReceiver(r)
+			require.NoError(t, c.Start(context.Background()))
+			require.Eventually(t, c.IsConnected, 2*time.Second, 5*time.Millisecond)
+
+			broker.deliver(1, "a.b", "stuck")
+			select {
+			case <-stuck.entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("the delivery never reached the subscriber")
+			}
+
+			tt.close(broker)
+			require.Eventually(t, func() bool { return logs.FilterMessage(tt.log).Len() == 1 },
+				2*time.Second, 5*time.Millisecond)
+			time.Sleep(50 * time.Millisecond) // into the receiver Stop's wait on the delivery
+
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			assert.ErrorIs(t, c.Drain(ctx), context.DeadlineExceeded,
+				"the drain reported success with a delivery still running")
+
+			stopped := make(chan struct{})
+			go func() {
+				_ = c.Stop()
+				close(stopped)
+			}()
+			select {
+			case <-stopped:
+			case <-time.After(3 * time.Second):
+				t.Fatal("Stop hung behind a receiver Stop waiting on a stuck delivery")
+			}
+		})
+	}
+}
+
+// stuckSubscriber takes a delivery and does not return until the test ends,
+// ignoring its context the way a stuck action would.
+type stuckSubscriber struct {
+	bus.BaseSubscriber
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *stuckSubscriber) OnEvent(context.Context, string, any, map[string]string) error {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return nil
 }
 
 func mustReceiver(t *testing.T) *receiver.RMQReceiver {

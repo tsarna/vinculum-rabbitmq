@@ -120,10 +120,17 @@ type RMQReceiver struct {
 	// that window.
 	drained bool
 
-	// stillDelivering is the channel a timed-out Drain was waiting on, closed
-	// when the loop finally finishes. Nil until the first drain, and set by
-	// every drain rather than only by one that gives up — what makes it answer
-	// "no" is the channel being closed, not the field being absent.
+	// stillDelivering is the loop-done channel of the last loop a Drain or a
+	// Stop took charge of, closed when that loop finally finishes. Nil until
+	// the first of them, and set by every one rather than only by one that
+	// gives up — what makes it answer "no" is the channel being closed, not the
+	// field being absent.
+	//
+	// Stop sets it as well as Drain because the channel-recovery and reconnect
+	// paths stop a receiver on their own goroutines, and a shutdown's Drain can
+	// arrive while one of those Stops is still waiting for a delivery. The
+	// Drain finds the loop already taken, and this is how it finds the loop to
+	// wait for instead of reporting a clean drain that has not happened.
 	//
 	// A channel rather than a flag because the question is asked a phase later
 	// and the answer moves in between: teardown runs a whole quiesce between
@@ -132,6 +139,29 @@ type RMQReceiver struct {
 	// otherwise and put an error in the log of a shutdown where nothing went
 	// wrong. See stillRunning.
 	stillDelivering atomic.Pointer[chan struct{}]
+
+	// gaveUp is closed the first time a Drain's deadline passes with a delivery
+	// still running. A Stop waiting for the loop gives up with it, because the
+	// drain has already given that delivery its bounded chance, and a Stop
+	// that went on waiting would hand the same stuck action the unbounded wait
+	// the drain's deadline exists to prevent. Terminal, like drained: a drain
+	// always precedes it, so no later cycle can start.
+	gaveUp     chan struct{}
+	gaveUpOnce sync.Once
+}
+
+// giveUp records that a drain's deadline passed with a delivery still running.
+func (r *RMQReceiver) giveUp() {
+	r.gaveUpOnce.Do(func() { close(r.gaveUp) })
+}
+
+func (r *RMQReceiver) hasGivenUp() bool {
+	select {
+	case <-r.gaveUp:
+		return true
+	default:
+		return false
+	}
 }
 
 // Unsettled reports how many deliveries this receiver has handed out that
@@ -338,10 +368,7 @@ func (r *RMQReceiver) Drain(ctx context.Context) error {
 	stopRead := r.stopRead
 	if stopRead == nil {
 		r.mu.Unlock()
-		if r.stillRunning() {
-			return fmt.Errorf("rabbitmq receiver: still delivering for queue %q", r.queue)
-		}
-		return nil
+		return r.awaitLoopTakenElsewhere(ctx)
 	}
 	ch, tag, done := r.ch, r.activeTag, r.loopDone
 	r.stopRead = nil
@@ -403,6 +430,7 @@ func (r *RMQReceiver) Drain(ctx context.Context) error {
 	// them is random. Half the time it would report a clean drain of a receiver
 	// whose consumer may still be registered.
 	if ctx.Err() != nil {
+		r.giveUp()
 		return fmt.Errorf("rabbitmq receiver: drain queue %q: %w", r.queue, ctx.Err())
 	}
 
@@ -417,6 +445,44 @@ func (r *RMQReceiver) Drain(ctx context.Context) error {
 		stopRead()
 		return nil
 	case <-ctx.Done():
+		r.giveUp()
+		return fmt.Errorf("rabbitmq receiver: drain queue %q: %w", r.queue, ctx.Err())
+	}
+}
+
+// awaitLoopTakenElsewhere is Drain for a receiver whose loop an earlier Drain or
+// a Stop has already taken charge of. There is no consumer left to withdraw,
+// but the loop may still be finishing a delivery, and a drain is a promise that
+// the deliveries already sent have been handled.
+//
+// It waits only when nothing has given up on that delivery yet — which is the
+// case of a Stop from the channel-recovery or reconnect path, still waiting
+// when the shutdown's Drain arrives. After a drain has already timed out on it,
+// waiting again would hand the stuck action a second chance to hold up the
+// process, so the timeout is reported straight away instead.
+func (r *RMQReceiver) awaitLoopTakenElsewhere(ctx context.Context) error {
+	if !r.stillRunning() {
+		return nil
+	}
+	if r.hasGivenUp() {
+		return fmt.Errorf("rabbitmq receiver: still delivering for queue %q", r.queue)
+	}
+
+	// Not reloaded after stillRunning: this Drain has set drained, so no Start
+	// can begin a new loop, and whoever else stores the field stores this one.
+	done := *r.stillDelivering.Load()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// Both may be ready at once, and a delivery that finished at the
+		// deadline was handled, so it is not a timeout.
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		r.giveUp()
 		return fmt.Errorf("rabbitmq receiver: drain queue %q: %w", r.queue, ctx.Err())
 	}
 }
@@ -435,6 +501,13 @@ func (r *RMQReceiver) Drain(ctx context.Context) error {
 // is *still* running is checked here rather than remembered from the drain, a
 // whole phase earlier.
 //
+// That holds whichever comes first. The client's channel-recovery and
+// reconnect paths call Stop on their own goroutines, and one of those can
+// already be waiting when a shutdown's Drain arrives. The Drain then waits for
+// the same loop under its own deadline, and if the deadline passes this Stop
+// stops waiting too — otherwise the goroutine it runs on, and the client's Stop
+// that joins that goroutine, would wait on the stuck action forever.
+//
 // Safe to call before Start (no-op) or repeatedly; repeated calls repeat the
 // answer, as Drain's do.
 func (r *RMQReceiver) Stop() error {
@@ -442,6 +515,12 @@ func (r *RMQReceiver) Stop() error {
 	stopWork := r.stopWork
 	done := r.loopDone
 	r.stopRead, r.stopWork, r.loopDone, r.ch = nil, nil, nil, nil
+	// Published under the lock that took the loop, for the same reason Drain
+	// publishes it: a concurrent Drain reads the two together, and between them
+	// would find the loop gone and nothing to wait for.
+	if done != nil {
+		r.stillDelivering.Store(&done)
+	}
 	r.mu.Unlock()
 
 	if stopWork == nil {
@@ -451,15 +530,20 @@ func (r *RMQReceiver) Stop() error {
 	// this one, so a Stop that was not preceded by a Drain still ends the loop.
 	stopWork()
 
-	if err := r.stoppedWithDeliveryRunning(); err != nil {
-		// The epoch still moves. The channel is about to go, and a tag that
-		// outlives it acknowledges nothing — or worse, on a reconnected channel,
-		// acknowledges something else.
-		r.epoch.Add(1)
-		return err
-	}
 	if done != nil {
-		<-done
+		select {
+		case <-done:
+		case <-r.gaveUp:
+			select {
+			case <-done:
+			default:
+				// The epoch still moves. The channel is about to go, and a tag
+				// that outlives it acknowledges nothing — or worse, on a
+				// reconnected channel, acknowledges something else.
+				r.epoch.Add(1)
+				return r.stoppedWithDeliveryRunning()
+			}
+		}
 	}
 
 	// After the loop has drained, not before. Waiting for it means a delivery

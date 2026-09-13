@@ -50,6 +50,11 @@ type Client struct {
 	lifeCtx       context.Context
 	cancelLife    context.CancelFunc
 	reconnectDone chan struct{}
+	// watchers tracks the per-channel watcher goroutines, so Stop can wait for
+	// them as it waits for reconnectDone. Only the reconnect goroutine starts
+	// them, and Stop waits here only after that goroutine has exited, so no Go
+	// can race the Wait.
+	watchers sync.WaitGroup
 
 	conn        *amqp.Connection
 	receiverChs []*amqp.Channel
@@ -209,6 +214,11 @@ func (c *Client) Stop() error {
 	if reconnectDone != nil {
 		<-reconnectDone
 	}
+	// A watcher already inside a channel recovery when the context was cancelled
+	// finishes that recovery before it notices, and then logs the outcome.
+	// Waiting for it here keeps that log line, and any receiver it restarted,
+	// on this side of the teardown below.
+	c.watchers.Wait()
 
 	// Stop receivers (resets their internal cancel/loopDone state so the
 	// instances can be reused if necessary). A receiver that gave up on a
@@ -385,10 +395,10 @@ func (c *Client) setupChannels(ctx context.Context, conn *amqp.Connection) error
 	// re-open just the affected channel rather than waiting for the
 	// connection-level reconnect loop to rebuild everything.
 	for i, ch := range senderChs {
-		go c.watchSenderChannel(ctx, i, ch)
+		c.watchers.Go(func() { c.watchSenderChannel(ctx, i, ch) })
 	}
 	for i, ch := range receiverChs {
-		go c.watchReceiverChannel(ctx, i, ch)
+		c.watchers.Go(func() { c.watchReceiverChannel(ctx, i, ch) })
 	}
 	return nil
 }
@@ -575,15 +585,21 @@ func (c *Client) dialOne(url string) (*amqp.Connection, error) {
 // we should defer to the connection-level reconnect loop) rather than just
 // the channel (so we can re-open the channel on the same connection).
 //
-// AMQP 0-9-1 reserves codes 500+ for hard (connection-level) errors. The
-// library also reports a connection close to each channel's NotifyClose; in
-// some cases the AMQP error is nil there. We treat a nil error as
-// connection-level too — a channel-level error always carries a code.
+// The library already classifies the code: for an error the broker sent, Recover
+// is set only for AMQP 0-9-1's soft (channel-level) exceptions, 311–313 and
+// 403–406. Every other code is a hard exception, and that includes some below
+// 500 — 320 CONNECTION_FORCED, which is what a broker sends when an operator
+// closes the connection, and 402 INVALID_PATH. A code-range test would send the
+// watcher into a channel recovery on a connection that is already gone. The
+// errors the library raises itself on a channel's NotifyClose — a frame error
+// when the socket fails, a channel or connection error when it closes one — are
+// all hard codes too.
+//
+// The watchers never pass nil: a close without an error closes the
+// notification channel instead, and they return on that before asking. Nil is
+// still answered, as connection-level, because it has no code to recover on.
 func isConnectionLevel(err *amqp.Error) bool {
-	if err == nil {
-		return true
-	}
-	return err.Code >= 500
+	return err == nil || !err.Recover
 }
 
 // watchSenderChannel watches the close-notify for a sender's channel and

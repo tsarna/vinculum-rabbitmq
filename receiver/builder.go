@@ -213,6 +213,7 @@ func (b *ReceiverBuilder) Build() (*RMQReceiver, error) {
 		logger:         b.logger,
 		meterProvider:  b.meterProvider,
 		tracerProvider: b.tracerProvider,
+		gaveUp:         make(chan struct{}),
 		metrics:        NewReceiverMetrics(b.clientName, meter),
 	}, nil
 }

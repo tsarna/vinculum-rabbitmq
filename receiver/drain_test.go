@@ -779,6 +779,67 @@ func TestATimedOutDrainNeverReportsSuccess(t *testing.T) {
 	}
 }
 
+// stopInBackground stops r off the test goroutine, the way the client's channel
+// recovery does, and returns once that Stop has taken charge of the loop.
+func stopInBackground(t *testing.T, r *RMQReceiver) <-chan error {
+	t.Helper()
+	stopped := make(chan error, 1)
+	go func() { stopped <- r.Stop() }()
+	require.Eventually(t, func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.stopWork == nil
+	}, 2*time.Second, time.Millisecond, "the background Stop never took the loop")
+	return stopped
+}
+
+// A channel recovery can be part-way through stopping a receiver, waiting on a
+// stuck delivery, when the shutdown's Drain arrives. The drain finds the loop
+// already taken, and must not report a clean drain for a delivery that is still
+// running — nor may that Stop go on waiting once the drain has given up, or the
+// goroutine it runs on holds up the client's Stop forever.
+func TestADrainBoundsAStopAlreadyWaitingOnAStuckDelivery(t *testing.T) {
+	b := newBlocker()
+	r, fc, a := drainFixture(t, AckAfterHandling, b)
+	defer close(b.release)
+
+	require.True(t, deliver(fc, a, "stuck", 1))
+	<-b.entered
+	stopped := stopInBackground(t, r)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := r.Drain(ctx)
+	require.Error(t, err, "the drain reported success with a delivery still running")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+
+	select {
+	case err := <-stopped:
+		assert.Error(t, err, "stopping past a running delivery should say so")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the Stop kept waiting on a delivery the drain had given up on")
+	}
+	assert.Error(t, r.Drain(context.Background()),
+		"a later drain should report the timeout straight away, not wait again")
+}
+
+// The same arrangement, with a delivery that finishes inside the deadline: the
+// drain waits for it and both report cleanly.
+func TestADrainWaitsForADeliveryAStopIsAlreadyWaitingOn(t *testing.T) {
+	b := newBlocker()
+	r, fc, a := drainFixture(t, AckAfterHandling, b)
+
+	require.True(t, deliver(fc, a, "slow", 1))
+	<-b.entered
+	stopped := stopInBackground(t, r)
+
+	time.AfterFunc(100*time.Millisecond, func() { close(b.release) })
+	require.NoError(t, drained(t, r))
+	assert.NotNil(t, b.errAfterRelease.Load(),
+		"the drain returned before the delivery it was waiting for had finished")
+	assert.NoError(t, <-stopped)
+}
+
 // Teardown calls both, in that order, and a receiver that was never started is
 // torn down along with everything else. None of that may panic or block.
 func TestDrainAndStopComposeInAnyOrder(t *testing.T) {

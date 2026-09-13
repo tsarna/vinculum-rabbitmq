@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Client.Stop` waits for the per-channel watchers.** They were started with a
+  bare `go` and never joined, so a watcher that was partway through a channel
+  recovery when `Stop` ran could log the outcome after `Stop` had returned. In a
+  process that is a log line after shutdown; under `-race`, with a logger bound
+  to a test, it is a data race against the test that owns the logger.
+
+- **A stuck delivery can no longer hang `Client.Stop` after a timed-out
+  `Drain`.** Channel recovery and the reconnect loop both stop the receiver on
+  their own goroutine, and that `RMQReceiver.Stop` waits for the delivery in
+  flight. A shutdown `Drain` that arrived while it was waiting found the loop
+  already taken and reported a clean drain at once, and `Client.Stop` then
+  waited on that goroutine — and so on the stuck action — forever. A handler
+  that never returns is exactly what trips RabbitMQ's `consumer_timeout`, whose
+  406 channel close starts such a recovery.
+
+  `Drain` now waits for that delivery under its own deadline and reports the
+  timeout, and a receiver `Stop` still waiting gives up once any drain has, the
+  same way a `Stop` that starts after a timed-out drain already did.
+
+- **A forced connection close goes straight to the reconnect loop.** A channel's
+  close was treated as connection-level only for codes of 500 and up, but AMQP
+  0-9-1's hard exceptions include `320 CONNECTION_FORCED` — what a broker sends
+  when an operator closes the connection — and `402 INVALID_PATH`. Those sent
+  every channel watcher into a recovery on a connection that was already gone,
+  and a warning for each when it failed. A watcher that lost the race with the
+  reconnect loop could instead open a second channel on the new connection and
+  replace the one the reconnect had just installed. The classification now uses
+  the library's own `Error.Recover`, which is set only for the soft,
+  channel-level codes — so a channel closed with any other code, `200`
+  included, is left to the reconnect loop rather than reopened.
+
 ## [0.9.0] - 2026-09-06
 
 ### Added
