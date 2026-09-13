@@ -49,10 +49,16 @@ func newFakeBroker(t *testing.T) *fakeBroker {
 func (b *fakeBroker) url() string { return "amqp://" + b.ln.Addr().String() + "/" }
 
 func (b *fakeBroker) serve() {
-	conn, err := b.ln.Accept()
-	if err != nil {
-		return
+	for {
+		conn, err := b.ln.Accept()
+		if err != nil {
+			return
+		}
+		b.handle(conn)
 	}
+}
+
+func (b *fakeBroker) handle(conn net.Conn) {
 	b.mu.Lock()
 	b.conn = conn
 	b.mu.Unlock()

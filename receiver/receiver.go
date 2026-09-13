@@ -524,6 +524,13 @@ func (r *RMQReceiver) Stop() error {
 	r.mu.Unlock()
 
 	if stopWork == nil {
+		if p := r.stillDelivering.Load(); p != nil {
+			select {
+			case <-*p:
+				return nil
+			case <-r.gaveUp:
+			}
+		}
 		return r.stoppedWithDeliveryRunning()
 	}
 	// Cancelling work cancels reading with it: the read context is derived from
