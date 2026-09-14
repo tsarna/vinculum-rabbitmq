@@ -1,0 +1,56 @@
+name: Integration
+
+# The integration tests against a real RabbitMQ. The steps live in vinculum's
+# reusable broker-integration.yml, which checks out this repository and reads
+# its broker from ci/: ci/brokers.yml for the service, ci/rabbitmq.env for where
+# the tests find it. This file is the trigger and the filter, not the work.
+#
+# Pinned to a commit rather than a branch, so a change to the workflow in
+# vinculum reaches this repository only when someone moves the pin here, in a
+# pull request that runs it.
+
+on:
+  # Path-filtered, because a job that starts a broker costs more than one that
+  # does not: these are the paths whose contents can change what the broker
+  # sees. A pull request touching only the README needs nothing here.
+  pull_request:
+    paths: &paths
+      - "client/**"
+      - "receiver/**"
+      - "sender/**"
+      - "carrier/**"
+      - "go.mod"
+      - "go.sum"
+      # The broker's own definition. A change to the compose file, the fixtures
+      # or this workflow is exactly a change that has to be run to be believed.
+      - "ci/**"
+      - ".github/workflows/integration.yml"
+  # main as well as pull requests, because a commit can reach main without one.
+  #
+  # Release tags too, though a tag run cannot hold a release back: nothing here
+  # publishes on a tag, and the module proxy serves the tag whether or not this
+  # passes. It is a record of the tagged commit against the broker. What keeps a
+  # tag from being cut unrun is the run on the commit before it — a pull
+  # request, a push to main, or workflow_dispatch. GitHub does not apply path
+  # filters to tag pushes, so every tag runs.
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: *paths
+  workflow_dispatch:
+
+# A second push to the same ref makes the first run's answer worthless, and a
+# broker held for it is a broker held for nothing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rabbitmq:
+    uses: tsarna/vinculum/.github/workflows/broker-integration.yml@7f0c5da5b30a48afbd1f4ece4a1f5c0e36db3700
+    with:
+      broker: rabbitmq
+      packages: ./client/...
