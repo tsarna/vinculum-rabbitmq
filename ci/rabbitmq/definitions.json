@@ -1,0 +1,29 @@
+{
+  "rabbit_version": "4.0.0",
+  "vhosts": [
+    { "name": "vinculum" }
+  ],
+  "users": [
+    {
+      "name": "vinculum",
+      "password": "vinculum",
+      "tags": ["management"]
+    }
+  ],
+  "permissions": [
+    {
+      "user": "vinculum",
+      "vhost": "vinculum",
+      "configure": ".*",
+      "write": ".*",
+      "read": ".*"
+    }
+  ],
+  "topic_permissions": [],
+  "parameters": [],
+  "global_parameters": [],
+  "policies": [],
+  "queues": [],
+  "bindings": [],
+  "exchanges": []
+}
