@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-20
+
 ### Fixed
 
 - **A forced connection close goes straight to the reconnect loop.** A channel's
