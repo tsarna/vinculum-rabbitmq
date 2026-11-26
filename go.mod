@@ -3,7 +3,7 @@ module github.com/tsarna/vinculum-rabbitmq
 go 1.26.0
 
 require (
-	github.com/rabbitmq/amqp091-go v1.11.0
+	github.com/rabbitmq/amqp091-go v1.17.0
 	github.com/stretchr/testify v1.12.1
 	github.com/tsarna/vinculum-bus v0.20.0
 	github.com/tsarna/vinculum-wire v0.5.0
